@@ -1,0 +1,57 @@
+app:
+  name: btc-trader
+  mode: live           # live | paper | backtest
+  log_level: info      # debug | info | warn | error
+  testnet: false
+
+exchange:
+  name: binance
+  market_type: spot    # spot | usdt_futures
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+  kline_intervals:
+    - 1m
+    - 5m
+    - 1h
+
+database:
+  dsn: postgres://trader:trader123@localhost:5432/btc_trader?sslmode=disable
+  max_open_conns: 10
+  max_idle_conns: 5
+  conn_max_lifetime: 5m
+
+strategy:
+  name: ema_crossover
+  config:
+    fast_period: 12
+    slow_period: 26
+    interval: 5m
+    rsi_filter: true
+    rsi_period: 14
+    rsi_overbought: 70
+    rsi_oversold: 30
+
+risk:
+  max_position_size_btc: 0.1
+  max_position_size_eth: 1.0
+  max_position_pct_account: 0.5
+  default_stop_loss_pct: 0.02
+  default_take_profit_pct: 0.05
+  trailing_stop_enabled: true
+  trailing_stop_pct: 0.015
+  max_daily_loss_usdt: 500
+  max_daily_loss_pct: 0.05
+  max_daily_trades: 20
+  max_drawdown_pct: 0.10
+  drawdown_cooldown_mins: 60
+  min_order_size_usdt: 10
+  max_slippage_pct: 0.002
+  min_time_between_orders: 30s
+
+dashboard:
+  enabled: true
+  addr: ":8080"
+
+snapshot:
+  interval: 5m
