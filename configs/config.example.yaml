@@ -51,7 +51,7 @@ risk:
 
 dashboard:
   enabled: true
-  addr: ":8080"
+  addr: ":9090"
 
 snapshot:
   interval: 5m

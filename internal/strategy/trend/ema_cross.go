@@ -3,7 +3,6 @@ package trend
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/jayce/btc-trader/internal/exchange"
 	"github.com/jayce/btc-trader/internal/strategy"
@@ -13,10 +12,10 @@ import (
 // A golden cross (fast EMA crosses above slow EMA) triggers a BUY.
 // A death cross (fast EMA crosses below slow EMA) triggers a SELL.
 type EMACrossStrategy struct {
-	fastPeriod  int
-	slowPeriod  int
-	rsiFilter   bool
-	rsiPeriod   int
+	fastPeriod    int
+	slowPeriod    int
+	rsiFilter     bool
+	rsiPeriod     int
 	rsiOverbought float64
 	rsiOversold   float64
 
@@ -159,52 +158,5 @@ func (s *EMACrossStrategy) OnTradeExecuted(trade *exchange.Trade) {
 	// Can be extended for trailing stop tracking
 }
 
-// Helper functions for config parsing
-func toInt(v interface{}) int {
-	switch val := v.(type) {
-	case int:
-		return val
-	case float64:
-		return int(val)
-	case int64:
-		return int(val)
-	default:
-		return 0
-	}
-}
-
-func toFloat(v interface{}) float64 {
-	switch val := v.(type) {
-	case float64:
-		return val
-	case int:
-		return float64(val)
-	case int64:
-		return float64(val)
-	default:
-		return 0
-	}
-}
-
-func toBool(v interface{}) bool {
-	if val, ok := v.(bool); ok {
-		return val
-	}
-	return false
-}
-
-func clamp(v, min, max float64) float64 {
-	if v < min {
-		return min
-	}
-	if v > max {
-		return max
-	}
-	return v
-}
-
 // Ensure compile-time interface compliance.
 var _ strategy.Strategy = (*EMACrossStrategy)(nil)
-
-// Suppress unused import
-var _ = time.Now

@@ -2,17 +2,14 @@ package timescale
 
 import (
 	"context"
-	"embed"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jayce/btc-trader/internal/config"
+	"github.com/jayce/btc-trader/internal/storage"
 	"go.uber.org/zap"
 )
-
-//go:embed ../migrations/*.sql
-var migrationsFS embed.FS
 
 // Store implements storage.Store using TimescaleDB.
 type Store struct {
@@ -63,17 +60,17 @@ func (s *Store) Migrate(ctx context.Context) error {
 		return fmt.Errorf("enable timescaledb extension: %w", err)
 	}
 
-	// Read and execute migration files in order
+	// Read and execute migration files in order using the embed.FS from storage package
 	migrations := []string{
-		"../migrations/001_create_klines.up.sql",
-		"../migrations/002_create_orders.up.sql",
-		"../migrations/003_create_trades.up.sql",
-		"../migrations/004_create_snapshots.up.sql",
-		"../migrations/005_create_signals.up.sql",
+		"migrations/001_create_klines.up.sql",
+		"migrations/002_create_orders.up.sql",
+		"migrations/003_create_trades.up.sql",
+		"migrations/004_create_snapshots.up.sql",
+		"migrations/005_create_signals.up.sql",
 	}
 
 	for _, path := range migrations {
-		data, err := migrationsFS.ReadFile(path)
+		data, err := storage.MigrationsFS.ReadFile(path)
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", path, err)
 		}

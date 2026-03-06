@@ -1,0 +1,1 @@
+function i(r,t=2){return r.toLocaleString("en-US",{minimumFractionDigits:t,maximumFractionDigits:t})}function e(r){return r>=1e3?i(r,2):r>=1?i(r,4):i(r,6)}function n(r){return`${r>=0?"+":""}${i(r,2)}`}function o(r){return`${r>=0?"+":""}${(r*100).toFixed(2)}%`}function f(r){return new Date(r).toLocaleString()}export{n as a,o as b,e as c,f as d,i as f};

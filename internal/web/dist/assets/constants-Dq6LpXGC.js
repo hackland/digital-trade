@@ -1,0 +1,1 @@
+const E=["BTCUSDT","ETHUSDT"],T=["1m","5m","15m","1h","4h","1d"],s={NEW:"primary",PARTIALLY_FILLED:"warning",FILLED:"success",CANCELED:"info",REJECTED:"danger",EXPIRED:"info"};export{T as I,E as S,s as a};

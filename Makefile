@@ -1,4 +1,4 @@
-.PHONY: build run test lint clean docker-up docker-down migrate backtest
+.PHONY: build run test lint clean docker-up docker-down migrate backtest dashboard-build dashboard-dev
 
 # Go parameters
 GOCMD=go
@@ -54,3 +54,13 @@ frontend-build:
 
 frontend-dev:
 	cd web/dashboard && pnpm dev
+
+# Dashboard (full build: frontend + embedded Go binary)
+dashboard-build: frontend-build
+	rm -rf internal/web/dist
+	cp -r web/dashboard/dist internal/web/dist
+	$(GOBUILD) $(LDFLAGS) -o bin/$(BINARY_NAME) ./cmd/trader
+
+# Dashboard dev mode (Go with -tags dev, frontend served by Vite)
+dashboard-dev:
+	$(GOBUILD) -tags dev -o bin/$(BINARY_NAME) ./cmd/trader && ./bin/$(BINARY_NAME)

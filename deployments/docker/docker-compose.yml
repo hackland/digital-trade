@@ -30,7 +30,7 @@ services:
       - BINANCE_SECRET_KEY=${BINANCE_SECRET_KEY}
       - DB_DSN=postgres://trader:${DB_PASSWORD:-trader123}@timescaledb:5432/btc_trader?sslmode=disable
     ports:
-      - "8080:8080"
+      - "9090:9090"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped

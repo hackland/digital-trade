@@ -103,7 +103,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("database.max_open_conns", 10)
 	v.SetDefault("database.max_idle_conns", 5)
 	v.SetDefault("database.conn_max_lifetime", "5m")
-	v.SetDefault("dashboard.addr", ":8080")
+	v.SetDefault("dashboard.addr", ":9090")
 	v.SetDefault("snapshot.interval", "5m")
 
 	if err := v.ReadInConfig(); err != nil {
@@ -128,11 +128,14 @@ func (c *Config) validate() error {
 	if len(c.Exchange.Symbols) == 0 {
 		return fmt.Errorf("exchange.symbols must not be empty")
 	}
-	if c.Exchange.APIKey == "" {
-		return fmt.Errorf("BINANCE_API_KEY environment variable is required")
-	}
-	if c.Exchange.SecretKey == "" {
-		return fmt.Errorf("BINANCE_SECRET_KEY environment variable is required")
+	if c.App.Mode == "live" {
+		// live 模式强制要求 API Key
+		if c.Exchange.APIKey == "" {
+			return fmt.Errorf("BINANCE_API_KEY is required in live mode")
+		}
+		if c.Exchange.SecretKey == "" {
+			return fmt.Errorf("BINANCE_SECRET_KEY is required in live mode")
+		}
 	}
 	if c.Database.DSN == "" {
 		return fmt.Errorf("database.dsn is required")

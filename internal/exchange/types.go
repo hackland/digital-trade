@@ -84,18 +84,18 @@ func (s OrderStatus) String() string {
 
 // Kline represents a candlestick bar.
 type Kline struct {
-	Symbol      string
-	Interval    string
-	OpenTime    time.Time
-	CloseTime   time.Time
-	Open        float64
-	High        float64
-	Low         float64
-	Close       float64
-	Volume      float64
-	QuoteVolume float64
-	Trades      int64
-	IsFinal     bool
+	Symbol      string    `json:"symbol"`
+	Interval    string    `json:"interval"`
+	OpenTime    time.Time `json:"open_time"`
+	CloseTime   time.Time `json:"close_time"`
+	Open        float64   `json:"open"`
+	High        float64   `json:"high"`
+	Low         float64   `json:"low"`
+	Close       float64   `json:"close"`
+	Volume      float64   `json:"volume"`
+	QuoteVolume float64   `json:"quote_volume"`
+	Trades      int64     `json:"trades"`
+	IsFinal     bool      `json:"is_final"`
 }
 
 // KlineRequest specifies parameters for historical kline queries.
@@ -205,13 +205,13 @@ type ExchangeInfo struct {
 
 // SymbolInfo contains trading rules for a symbol.
 type SymbolInfo struct {
-	Symbol             string
-	BaseAsset          string
-	QuoteAsset         string
-	MinQty             float64
-	MaxQty             float64
-	StepSize           float64
-	MinNotional        float64
-	PricePrecision     int
-	QuantityPrecision  int
+	Symbol            string
+	BaseAsset         string
+	QuoteAsset        string
+	MinQty            float64
+	MaxQty            float64
+	StepSize          float64
+	MinNotional       float64
+	PricePrecision    int
+	QuantityPrecision int
 }
