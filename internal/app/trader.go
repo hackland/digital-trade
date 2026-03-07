@@ -508,5 +508,8 @@ func createStrategy(cfg config.StrategyConfig) (strategy.Strategy, error) {
 	reg.Register("ema_crossover", func() strategy.Strategy { return trend.NewEMACrossStrategy() })
 	reg.Register("macd_rsi", func() strategy.Strategy { return trend.NewMACDRSIStrategy() })
 	reg.Register("bb_breakout", func() strategy.Strategy { return trend.NewBBBreakoutStrategy() })
+	reg.Register("vwap_reversion", func() strategy.Strategy { return trend.NewVWAPReversionStrategy() })
+	reg.Register("volume_trend", func() strategy.Strategy { return trend.NewVolumeTrendStrategy() })
+	reg.Register("composite_score", func() strategy.Strategy { return trend.NewCompositeScoreStrategy() })
 	return reg.Create(cfg.Name, cfg.Config)
 }

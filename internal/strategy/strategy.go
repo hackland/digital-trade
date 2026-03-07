@@ -67,6 +67,11 @@ type IndicatorSet struct {
 	OBV  float64
 	MFI  map[int]float64 // period -> value
 	VWAP float64
+
+	// Volume-based indicators
+	CMF       map[int]float64 // period -> value (-1 to +1)
+	ADL       float64         // Accumulation/Distribution Line
+	VolumeSMA map[int]float64 // period -> volume moving average
 }
 
 // MACDValue holds MACD indicator components.

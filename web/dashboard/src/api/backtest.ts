@@ -5,6 +5,8 @@ export interface BacktestRequest {
   symbol: string
   interval: string
   strategy: string
+  price_strategy?: string
+  volume_strategy?: string
   days?: number
   start?: string
   end?: string

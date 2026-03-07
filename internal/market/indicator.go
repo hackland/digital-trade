@@ -26,11 +26,13 @@ func (ic *IndicatorComputer) ComputeAll(
 	volumes := extractVolumes(klines)
 
 	set := strategy.IndicatorSet{
-		SMA: make(map[int]float64),
-		EMA: make(map[int]float64),
-		RSI: make(map[int]float64),
-		ATR: make(map[int]float64),
-		MFI: make(map[int]float64),
+		SMA:       make(map[int]float64),
+		EMA:       make(map[int]float64),
+		RSI:       make(map[int]float64),
+		ATR:       make(map[int]float64),
+		MFI:       make(map[int]float64),
+		CMF:       make(map[int]float64),
+		VolumeSMA: make(map[int]float64),
 	}
 
 	for _, req := range requirements {
@@ -75,6 +77,14 @@ func (ic *IndicatorComputer) ComputeAll(
 			set.MFI[period] = ic.ComputeMFI(highs, lows, closes, volumes, period)
 		case "VWAP":
 			set.VWAP = ic.ComputeVWAP(highs, lows, closes, volumes)
+		case "CMF":
+			period := req.Params["period"]
+			set.CMF[period] = ic.ComputeCMF(highs, lows, closes, volumes, period)
+		case "ADL":
+			set.ADL = ic.ComputeADL(highs, lows, closes, volumes)
+		case "VolumeSMA":
+			period := req.Params["period"]
+			set.VolumeSMA[period] = ic.ComputeVolumeSMA(volumes, period)
 		}
 	}
 
@@ -347,6 +357,67 @@ func (ic *IndicatorComputer) ComputeVWAP(highs, lows, closes, volumes []float64)
 		return 0
 	}
 	return cumulativeTPV / cumulativeVol
+}
+
+// ComputeCMF calculates Chaikin Money Flow over a period.
+// CMF = Sum(Money Flow Volume) / Sum(Volume) over the period.
+// Range: -1.0 to +1.0. Positive = buying pressure, Negative = selling pressure.
+func (ic *IndicatorComputer) ComputeCMF(highs, lows, closes, volumes []float64, period int) float64 {
+	n := len(closes)
+	if n < period || period <= 0 {
+		return 0
+	}
+
+	sumMFV := 0.0 // Money Flow Volume
+	sumVol := 0.0
+
+	for i := n - period; i < n; i++ {
+		hl := highs[i] - lows[i]
+		if hl == 0 {
+			continue // avoid division by zero
+		}
+		// Money Flow Multiplier = ((Close - Low) - (High - Close)) / (High - Low)
+		mfm := ((closes[i] - lows[i]) - (highs[i] - closes[i])) / hl
+		sumMFV += mfm * volumes[i]
+		sumVol += volumes[i]
+	}
+
+	if sumVol == 0 {
+		return 0
+	}
+	return sumMFV / sumVol
+}
+
+// ComputeADL calculates the Accumulation/Distribution Line (final value).
+// ADL is a cumulative indicator: ADL += MFM * Volume for each bar.
+func (ic *IndicatorComputer) ComputeADL(highs, lows, closes, volumes []float64) float64 {
+	if len(closes) < 2 {
+		return 0
+	}
+
+	adl := 0.0
+	for i := 0; i < len(closes); i++ {
+		hl := highs[i] - lows[i]
+		if hl == 0 {
+			continue
+		}
+		mfm := ((closes[i] - lows[i]) - (highs[i] - closes[i])) / hl
+		adl += mfm * volumes[i]
+	}
+	return adl
+}
+
+// ComputeVolumeSMA calculates Simple Moving Average of volume over a period.
+func (ic *IndicatorComputer) ComputeVolumeSMA(volumes []float64, period int) float64 {
+	n := len(volumes)
+	if n < period || period <= 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, v := range volumes[n-period:] {
+		sum += v
+	}
+	return sum / float64(period)
 }
 
 // --- Helpers ---

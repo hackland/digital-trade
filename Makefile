@@ -1,4 +1,4 @@
-.PHONY: build run test lint clean docker-up docker-down migrate backtest dashboard-build dashboard-dev
+.PHONY: build run test lint clean docker-up docker-down migrate backtest klinebackfill dashboard-build dashboard-dev
 
 # Go parameters
 GOCMD=go
@@ -7,6 +7,7 @@ GOTEST=$(GOCMD) test
 GOVET=$(GOCMD) vet
 BINARY_NAME=btc-trader
 BACKTESTER_NAME=backtester
+KLINEBACKFILL_NAME=klinebackfill
 
 # Build flags
 LDFLAGS=-ldflags "-s -w"
@@ -14,6 +15,7 @@ LDFLAGS=-ldflags "-s -w"
 build:
 	$(GOBUILD) $(LDFLAGS) -o bin/$(BINARY_NAME) ./cmd/trader
 	$(GOBUILD) $(LDFLAGS) -o bin/$(BACKTESTER_NAME) ./cmd/backtester
+	$(GOBUILD) $(LDFLAGS) -o bin/$(KLINEBACKFILL_NAME) ./cmd/klinebackfill
 
 run:
 	$(GOBUILD) -o bin/$(BINARY_NAME) ./cmd/trader && ./bin/$(BINARY_NAME)
@@ -44,6 +46,10 @@ migrate:
 # Backtest
 backtest:
 	$(GOBUILD) -o bin/$(BACKTESTER_NAME) ./cmd/backtester && ./bin/$(BACKTESTER_NAME)
+
+# K-line backfill (pull 1yr from Binance into DB)
+klinebackfill:
+	$(GOBUILD) -o bin/$(KLINEBACKFILL_NAME) ./cmd/klinebackfill && ./bin/$(KLINEBACKFILL_NAME) -days 365
 
 # Frontend
 frontend-install:
