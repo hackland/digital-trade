@@ -106,10 +106,30 @@ func (m *Manager) ProcessSignal(ctx context.Context, sig *strategy.Signal) error
 		return nil
 	}
 
-	// Place order
-	order, err := m.exchange.PlaceOrder(ctx, *req)
+	// Place order with retry
+	var order *exchange.Order
+	maxRetries := 3
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		order, err = m.exchange.PlaceOrder(ctx, *req)
+		if err == nil {
+			break
+		}
+		if attempt < maxRetries {
+			backoff := time.Duration(1<<uint(attempt)) * time.Second // 1s, 2s, 4s
+			m.logger.Warn("order placement failed, retrying",
+				zap.Int("attempt", attempt+1),
+				zap.Duration("backoff", backoff),
+				zap.Error(err),
+			)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+	}
 	if err != nil {
-		return fmt.Errorf("place order: %w", err)
+		return fmt.Errorf("place order after %d retries: %w", maxRetries, err)
 	}
 
 	// Track active order
@@ -247,12 +267,28 @@ func (m *Manager) buildOrderRequest(ctx context.Context, sig *strategy.Signal) (
 		return nil, fmt.Errorf("get balance: %w", err)
 	}
 
-	// Use a fraction of available balance based on signal strength
-	allocPct := 0.1 * sig.Strength // 0-10% of balance
-	allocUSDT := balance.Free * allocPct
+	if sig.Action == strategy.Buy {
+		// 买入: 使用 alloc_pct 配置决定仓位大小
+		allocPct := m.riskCfg.AllocPct
+		if allocPct <= 0 {
+			allocPct = 0.5 // 默认 50%
+		}
+		if allocPct > 1.0 {
+			allocPct = 1.0
+		}
+		allocUSDT := balance.Free * allocPct
 
-	if ticker.AskPrice > 0 {
-		req.Quantity = allocUSDT / ticker.AskPrice
+		if ticker.AskPrice > 0 {
+			req.Quantity = allocUSDT / ticker.AskPrice
+		}
+	} else {
+		// 卖出: 使用当前持仓全部数量
+		pos := m.position.GetPosition(sig.Symbol)
+		if pos.Quantity > 0 {
+			req.Quantity = pos.Quantity
+		} else {
+			return nil, fmt.Errorf("no position to sell for %s", sig.Symbol)
+		}
 	}
 
 	return req, nil
@@ -274,7 +310,30 @@ func (m *Manager) handleOrderUpdate(ctx context.Context, order *exchange.Order) 
 		delete(m.activeOrders, order.ID)
 		m.mu.Unlock()
 
+	case exchange.OrderStatusPartiallyFilled:
+		// Track partial fill — update position with what we've received so far
+		m.logger.Warn("order partially filled",
+			zap.Int64("order_id", order.ID),
+			zap.String("symbol", order.Symbol),
+			zap.Float64("filled", order.FilledQty),
+			zap.Float64("total", order.Quantity),
+		)
+		// Position will be fully updated when FILLED arrives.
+		// Keep tracking in activeOrders.
+
 	case exchange.OrderStatusCanceled, exchange.OrderStatusRejected, exchange.OrderStatusExpired:
+		// If partially filled before cancel, record the partial fill as a trade
+		if order.FilledQty > 0 {
+			m.logger.Warn("order ended with partial fill",
+				zap.Int64("order_id", order.ID),
+				zap.Float64("filled_qty", order.FilledQty),
+				zap.String("status", order.Status.String()),
+			)
+			partialOrder := *order
+			partialOrder.Status = exchange.OrderStatusFilled
+			partialOrder.Quantity = order.FilledQty
+			m.onOrderFilled(ctx, &partialOrder, "partial_"+order.Status.String())
+		}
 		m.mu.Lock()
 		delete(m.activeOrders, order.ID)
 		m.mu.Unlock()

@@ -54,13 +54,14 @@ type StrategyConfig struct {
 }
 
 type RiskConfig struct {
+	AllocPct             float64       `mapstructure:"alloc_pct"` // 每笔交易使用可用余额的比例 (0.0-1.0)
 	MaxPositionSizeBTC   float64       `mapstructure:"max_position_size_btc"`
 	MaxPositionSizeETH   float64       `mapstructure:"max_position_size_eth"`
 	MaxPositionPctAcct   float64       `mapstructure:"max_position_pct_account"`
 	DefaultStopLossPct   float64       `mapstructure:"default_stop_loss_pct"`
 	DefaultTakeProfitPct float64       `mapstructure:"default_take_profit_pct"`
-	ATRStopMultiplier    float64       `mapstructure:"atr_stop_multiplier"`    // SL = entry - ATR * multiplier (0 = disabled)
-	ATRTPMultiplier      float64       `mapstructure:"atr_tp_multiplier"`      // TP = entry + ATR * multiplier (0 = disabled)
+	ATRStopMultiplier    float64       `mapstructure:"atr_stop_multiplier"` // SL = entry - ATR * multiplier (0 = disabled)
+	ATRTPMultiplier      float64       `mapstructure:"atr_tp_multiplier"`   // TP = entry + ATR * multiplier (0 = disabled)
 	TrailingStopEnabled  bool          `mapstructure:"trailing_stop_enabled"`
 	TrailingStopPct      float64       `mapstructure:"trailing_stop_pct"`
 	MaxDailyLossUSDT     float64       `mapstructure:"max_daily_loss_usdt"`

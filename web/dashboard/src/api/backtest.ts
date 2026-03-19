@@ -122,3 +122,18 @@ export async function getIndicatorModules(): Promise<IndicatorModulesResponse> {
   const res = await http.get<ApiResponse<IndicatorModulesResponse>>('/indicator/modules')
   return res.data.data
 }
+
+export interface DeployRequest {
+  modules: { name: string; weight: number }[]
+  signal_params: Record<string, any>
+}
+
+export interface DeployResponse {
+  message: string
+  config: Record<string, any>
+}
+
+export async function deployStrategy(req: DeployRequest): Promise<DeployResponse> {
+  const res = await http.post<ApiResponse<DeployResponse>>('/strategy/deploy', req)
+  return res.data.data
+}

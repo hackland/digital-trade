@@ -87,13 +87,33 @@ func (h *Handler) RunBacktest(c *gin.Context) {
 		return
 	}
 
-	// Load klines
+	// Load klines: try DB first, fallback to exchange API for missing data
 	ctx := c.Request.Context()
 	klines, err := backtest.LoadKlinesFromStore(ctx, h.deps.Store, req.Symbol, req.Interval, start, end)
 	if err != nil {
-		h.logger.Error("load klines for backtest", zap.Error(err))
-		errResp(c, http.StatusInternalServerError, "failed to load klines: "+err.Error())
-		return
+		h.logger.Warn("load klines from store failed, will fetch from exchange", zap.Error(err))
+	}
+
+	// Calculate expected kline count and check if we need to fetch more
+	expectedCount := backtest.ExpectedKlineCount(req.Interval, start, end)
+	if len(klines) < expectedCount*8/10 { // less than 80% coverage → fetch from exchange
+		h.logger.Info("fetching klines from exchange",
+			zap.String("symbol", req.Symbol),
+			zap.String("interval", req.Interval),
+			zap.Int("db_count", len(klines)),
+			zap.Int("expected", expectedCount),
+		)
+		fetched, fetchErr := backtest.FetchKlinesFromExchange(ctx, h.deps.Exchange, req.Symbol, req.Interval, start, end)
+		if fetchErr != nil {
+			h.logger.Error("fetch klines from exchange", zap.Error(fetchErr))
+			if len(klines) == 0 {
+				errResp(c, http.StatusInternalServerError, "failed to load klines: "+fetchErr.Error())
+				return
+			}
+			// Use whatever we got from DB
+		} else {
+			klines = fetched
+		}
 	}
 
 	if len(klines) == 0 {
@@ -115,9 +135,12 @@ func (h *Handler) RunBacktest(c *gin.Context) {
 		htfInterval := cwStrat.HTFInterval()
 		if htfInterval != "" {
 			htfKlines, htfErr := backtest.LoadKlinesFromStore(ctx, h.deps.Store, req.Symbol, htfInterval, start, end)
-			if htfErr != nil {
-				h.logger.Warn("load HTF klines", zap.String("interval", htfInterval), zap.Error(htfErr))
-			} else if len(htfKlines) > 0 {
+			if htfErr != nil || len(htfKlines) < backtest.ExpectedKlineCount(htfInterval, start, end)*8/10 {
+				if fetched, fe := backtest.FetchKlinesFromExchange(ctx, h.deps.Exchange, req.Symbol, htfInterval, start, end); fe == nil {
+					htfKlines = fetched
+				}
+			}
+			if len(htfKlines) > 0 {
 				engineCfg.HTFKlines = htfKlines
 				engineCfg.HTFInterval = htfInterval
 				engineCfg.HTFIndReqs = cwStrat.HTFIndicatorRequirements()

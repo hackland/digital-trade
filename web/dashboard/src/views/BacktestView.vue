@@ -200,8 +200,56 @@
         >
           Run Backtest
         </el-button>
+        <el-popconfirm
+          v-if="result"
+          title="确认将当前策略参数部署到实盘引擎？"
+          confirm-button-text="确认部署"
+          cancel-button-text="取消"
+          @confirm="doDeploy"
+        >
+          <template #reference>
+            <el-button
+              type="success"
+              :loading="deploying"
+              size="small"
+              style="margin-left: 12px; height: 32px; font-weight: 600"
+            >
+              部署到实盘
+            </el-button>
+          </template>
+        </el-popconfirm>
+        <el-button
+          size="small"
+          @click="showLiveStrategy"
+          :loading="loadingLive"
+          style="margin-left: 12px; height: 32px"
+        >
+          查看实盘策略
+        </el-button>
       </div>
     </el-card>
+
+    <!-- Live Strategy Dialog -->
+    <el-dialog v-model="liveDialogVisible" title="当前实盘策略" width="500px">
+      <div v-if="liveConfig" style="font-size: 14px; line-height: 2">
+        <div style="margin-bottom: 12px; font-weight: 600; color: #f0b90b">模块配置</div>
+        <div v-for="m in liveConfig.modules" :key="m.name" style="padding-left: 12px">
+          {{ m.name }} — {{ (m.weight * 100).toFixed(0) }}%
+        </div>
+        <el-divider />
+        <div style="margin-bottom: 8px; font-weight: 600; color: #f0b90b">信号参数</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; padding-left: 12px">
+          <span>买入阈值</span><span>{{ liveConfig.buy_threshold }}</span>
+          <span>卖出阈值</span><span>{{ liveConfig.sell_threshold }}</span>
+          <span>确认K线</span><span>{{ liveConfig.confirm_bars }}</span>
+          <span>冷却期</span><span>{{ liveConfig.cooldown_bars }}</span>
+          <span>最短持仓</span><span>{{ liveConfig.min_hold_bars }}</span>
+          <span>ATR止损倍数</span><span>{{ liveConfig.atr_stop_mult }}</span>
+          <span>趋势过滤</span><span>{{ liveConfig.trend_filter ? '开启' : '关闭' }}</span>
+          <span>大周期过滤</span><span>{{ liveConfig.htf_enabled ? liveConfig.htf_interval + ' / EMA' + liveConfig.htf_period : '关闭' }}</span>
+        </div>
+      </div>
+    </el-dialog>
 
     <!-- Results -->
     <template v-if="result">
@@ -351,7 +399,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { createChart, type IChartApi, type ISeriesApi, ColorType } from 'lightweight-charts'
-import { runBacktest as apiRunBacktest, getStrategies, getIndicatorModules, type BacktestRequest, type BacktestResult, type StrategyInfo, type ModuleMeta, type ParamSchema, type SignalPreset } from '@/api/backtest'
+import { runBacktest as apiRunBacktest, getStrategies, getIndicatorModules, deployStrategy, type BacktestRequest, type BacktestResult, type StrategyInfo, type ModuleMeta, type ParamSchema, type SignalPreset } from '@/api/backtest'
+import http from '@/api/http'
 import { fetchKlines } from '@/api/klines'
 import { SYMBOLS, INTERVALS } from '@/utils/constants'
 import { formatPrice, formatTime } from '@/utils/format'
@@ -365,6 +414,7 @@ const dayPresets = [
   { label: '90D', days: 90 },
   { label: '180D', days: 180 },
   { label: '365D', days: 365 },
+  { label: '2Y', days: 730 },
 ]
 
 const form = ref({
@@ -383,6 +433,10 @@ const dateRange = ref<[string, string] | null>(null)
 const allocPct = ref(100)
 const feePct = ref(0.1)
 const loading = ref(false)
+const deploying = ref(false)
+const loadingLive = ref(false)
+const liveDialogVisible = ref(false)
+const liveConfig = ref<Record<string, any> | null>(null)
 const result = ref<BacktestResult | null>(null)
 const selectedTradeIndex = ref<number | null>(null)
 const strategies = ref<StrategyInfo[]>([
@@ -610,6 +664,36 @@ async function doBacktest() {
     ElMessage.error('Backtest failed: ' + (e.response?.data?.message || e.message))
   } finally {
     loading.value = false
+  }
+}
+
+async function doDeploy() {
+  deploying.value = true
+  try {
+    const config = buildStrategyConfig()
+    const mods = config.modules.map((m: any) => ({ name: m.name, weight: m.weight }))
+    const signalParams: Record<string, any> = { ...config }
+    delete signalParams.modules
+
+    await deployStrategy({ modules: mods, signal_params: signalParams })
+    ElMessage.success('策略已部署到实盘引擎')
+  } catch (e: any) {
+    ElMessage.error('部署失败: ' + (e.response?.data?.message || e.message))
+  } finally {
+    deploying.value = false
+  }
+}
+
+async function showLiveStrategy() {
+  loadingLive.value = true
+  try {
+    const res = await http.get('/strategy/status')
+    liveConfig.value = res.data.data.config
+    liveDialogVisible.value = true
+  } catch (e: any) {
+    ElMessage.error('获取失败: ' + (e.response?.data?.message || e.message))
+  } finally {
+    loadingLive.value = false
   }
 }
 
@@ -965,19 +1049,32 @@ onBeforeUnmount(() => {
 :deep(.el-empty__description p) {
   color: #888 !important;
 }
-/* Date picker dark theme */
+/* Date picker dark theme & readability */
 :deep(.el-date-editor) {
   --el-date-editor-width: 280px;
+  background: #252526 !important;
+  border-radius: 4px !important;
+}
+:deep(.el-date-editor.el-input__wrapper) {
+  background: #252526 !important;
+  box-shadow: 0 0 0 1px #444 inset !important;
+}
+:deep(.el-range-editor.el-input__wrapper) {
+  background: #252526 !important;
+  box-shadow: 0 0 0 1px #444 inset !important;
+  height: 32px !important;
 }
 :deep(.el-range-input) {
   background: transparent !important;
   color: #e0e0e0 !important;
+  font-size: 13px !important;
 }
 :deep(.el-range-separator) {
-  color: #888 !important;
+  color: #b0b0b0 !important;
+  font-size: 12px !important;
 }
-:deep(.el-date-editor .el-range-input) {
-  color: #e0e0e0 !important;
+:deep(.el-date-editor .el-range-input::placeholder) {
+  color: #777 !important;
 }
 
 /* Custom Weighted Panel */

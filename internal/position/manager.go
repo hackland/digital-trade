@@ -1,6 +1,7 @@
 package position
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -159,6 +160,52 @@ func (m *Manager) TotalRealizedPnL() float64 {
 		total += pos.RealizedPnL
 	}
 	return total
+}
+
+// SyncFromAccount initializes positions from exchange account balances.
+// Must be called on startup to recover state from previous sessions.
+func (m *Manager) SyncFromAccount(balances []exchange.Balance, symbols []string, getPrice func(string) float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	symbolSet := make(map[string]bool, len(symbols))
+	for _, s := range symbols {
+		// Extract base asset from pair, e.g. "BTCUSDT" → "BTC"
+		base := strings.TrimSuffix(s, "USDT")
+		symbolSet[base] = true
+	}
+
+	for _, b := range balances {
+		if !symbolSet[b.Asset] {
+			continue
+		}
+		totalQty := b.Free + b.Locked
+		if totalQty < 1e-8 {
+			continue
+		}
+
+		symbol := b.Asset + "USDT"
+		price := getPrice(symbol)
+
+		pos := &Position{
+			Symbol:       symbol,
+			Quantity:     totalQty,
+			CurrentPrice: price,
+			Side:         "LONG",
+		}
+
+		// We don't know the original entry price from Binance account API.
+		// Use current price as a conservative estimate — PnL starts from 0.
+		pos.AvgEntryPrice = price
+		pos.UnrealizedPnL = 0
+
+		m.positions[symbol] = pos
+		m.logger.Info("position synced from account",
+			zap.String("symbol", symbol),
+			zap.Float64("qty", totalQty),
+			zap.Float64("price", price),
+		)
+	}
 }
 
 // Suppress unused import

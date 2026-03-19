@@ -1,8 +1,12 @@
 package handler
 
 import (
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 	"github.com/jayce/btc-trader/internal/strategy/modules"
+	"github.com/jayce/btc-trader/internal/strategy/trend"
+	"go.uber.org/zap"
 )
 
 type strategyResponse struct {
@@ -12,30 +16,23 @@ type strategyResponse struct {
 }
 
 // GetStrategyStatus returns the current strategy configuration and state.
+// If strategy supports GetConfig(), returns live running config (reflects deploy changes).
 func (h *Handler) GetStrategyStatus(c *gin.Context) {
 	strat := h.deps.Strategy
-	cfg := h.deps.Config.Strategy
 
-	interval := "5m"
-	rsiFilter := false
-	if v, exists := cfg.Config["interval"]; exists {
-		if s, valid := v.(string); valid {
-			interval = s
-		}
-	}
-	if v, exists := cfg.Config["rsi_filter"]; exists {
-		if b, valid := v.(bool); valid {
-			rsiFilter = b
-		}
+	// Prefer live config from strategy instance (reflects hot-reload)
+	var liveConfig map[string]interface{}
+	if cw, ok := strat.(*trend.CustomWeightedStrategy); ok {
+		liveConfig = cw.GetConfig()
+	} else {
+		liveConfig = h.deps.Config.Strategy.Config
 	}
 
 	ok(c, gin.H{
 		"name":                strat.Name(),
-		"interval":            interval,
-		"rsi_filter":          rsiFilter,
 		"required_history":    strat.RequiredHistory(),
 		"required_indicators": strat.RequiredIndicators(),
-		"config":              cfg.Config,
+		"config":              liveConfig,
 	})
 }
 
@@ -72,14 +69,14 @@ func (h *Handler) GetIndicatorModules(c *gin.Context) {
 		},
 		"signal_presets": map[string]map[string]any{
 			"conservative": {
-				"label":         "保守",
-				"desc":          "低频交易，高确认，严格过滤",
+				"label":          "保守",
+				"desc":           "低频交易，高确认，严格过滤",
 				"buy_threshold":  0.30,
 				"sell_threshold": -0.30,
 				"confirm_bars":   2,
 				"cooldown_bars":  24,
-				"min_hold_bars":  12,
-				"atr_stop_mult":  3.5,
+				"min_hold_bars":  30,
+				"atr_stop_mult":  4.5,
 				"trend_filter":   false,
 				"trend_period":   50,
 				"htf_enabled":    true,
@@ -87,14 +84,14 @@ func (h *Handler) GetIndicatorModules(c *gin.Context) {
 				"htf_period":     10,
 			},
 			"standard": {
-				"label":         "标准",
-				"desc":          "推荐配置: EMA+MACD+MFI, 日线过滤",
+				"label":          "标准",
+				"desc":           "推荐: EMA+MACD+MFI, 日线过滤",
 				"buy_threshold":  0.20,
 				"sell_threshold": -0.30,
 				"confirm_bars":   1,
 				"cooldown_bars":  12,
-				"min_hold_bars":  6,
-				"atr_stop_mult":  3.0,
+				"min_hold_bars":  24,
+				"atr_stop_mult":  4.5,
 				"trend_filter":   false,
 				"trend_period":   50,
 				"htf_enabled":    true,
@@ -102,14 +99,14 @@ func (h *Handler) GetIndicatorModules(c *gin.Context) {
 				"htf_period":     10,
 			},
 			"aggressive": {
-				"label":         "激进",
-				"desc":          "低阈值、快进快出，交易频率高",
+				"label":          "激进",
+				"desc":           "低阈值、快进快出，交易频率高",
 				"buy_threshold":  0.10,
 				"sell_threshold": -0.15,
 				"confirm_bars":   1,
 				"cooldown_bars":  2,
-				"min_hold_bars":  3,
-				"atr_stop_mult":  2.0,
+				"min_hold_bars":  6,
+				"atr_stop_mult":  2.5,
 				"trend_filter":   false,
 				"trend_period":   30,
 				"htf_enabled":    true,
@@ -117,5 +114,59 @@ func (h *Handler) GetIndicatorModules(c *gin.Context) {
 				"htf_period":     10,
 			},
 		},
+	})
+}
+
+// DeployStrategy hot-reloads the running strategy with new configuration.
+// POST /api/v1/strategy/deploy
+func (h *Handler) DeployStrategy(c *gin.Context) {
+	var req struct {
+		Modules []struct {
+			Name   string  `json:"name"`
+			Weight float64 `json:"weight"`
+		} `json:"modules"`
+		SignalParams map[string]interface{} `json:"signal_params"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Build config map matching strategy.Init() format
+	cfg := make(map[string]interface{})
+
+	// Modules
+	modList := make([]interface{}, 0, len(req.Modules))
+	for _, m := range req.Modules {
+		modList = append(modList, map[string]interface{}{
+			"name":   m.Name,
+			"weight": m.Weight,
+		})
+	}
+	cfg["modules"] = modList
+
+	// Signal params (buy_threshold, sell_threshold, cooldown_bars, etc.)
+	for k, v := range req.SignalParams {
+		cfg[k] = v
+	}
+
+	// Type-assert to CustomWeightedStrategy for Reconfigure
+	cw, isCW := h.deps.Strategy.(*trend.CustomWeightedStrategy)
+	if !isCW {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "strategy does not support hot-reload"})
+		return
+	}
+
+	if err := cw.Reconfigure(cfg); err != nil {
+		h.logger.Error("strategy deploy failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Return new running config as confirmation
+	h.logger.Info("strategy deployed via API")
+	ok(c, gin.H{
+		"message": "策略已部署",
+		"config":  cw.GetConfig(),
 	})
 }

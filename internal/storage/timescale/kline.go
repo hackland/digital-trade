@@ -96,6 +96,32 @@ func (s *Store) GetKlines(ctx context.Context, symbol, interval string, start, e
 	return klines, rows.Err()
 }
 
+// GetEarliestKline returns the oldest kline for a symbol/interval.
+func (s *Store) GetEarliestKline(ctx context.Context, symbol, interval string) (*exchange.Kline, error) {
+	query := `
+		SELECT time, symbol, interval, open, high, low, close, volume, quote_volume, trades, is_final
+		FROM klines
+		WHERE symbol = $1 AND interval = $2
+		ORDER BY time ASC
+		LIMIT 1
+	`
+
+	var k exchange.Kline
+	err := s.pool.QueryRow(ctx, query, symbol, interval).Scan(
+		&k.OpenTime, &k.Symbol, &k.Interval,
+		&k.Open, &k.High, &k.Low, &k.Close,
+		&k.Volume, &k.QuoteVolume, &k.Trades, &k.IsFinal,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("query earliest kline: %w", err)
+	}
+
+	return &k, nil
+}
+
 // GetLatestKline returns the most recent kline for a symbol/interval.
 func (s *Store) GetLatestKline(ctx context.Context, symbol, interval string) (*exchange.Kline, error) {
 	query := `

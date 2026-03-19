@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/jayce/btc-trader/internal/exchange"
 	"github.com/jayce/btc-trader/internal/strategy"
@@ -24,6 +25,8 @@ import (
 //   - Minimum hold period: prevents premature exits
 //   - ATR trailing stop: volatility-adaptive stop loss
 type CustomWeightedStrategy struct {
+	mu sync.RWMutex // protects reconfiguration
+
 	// Active modules with weights
 	weightedModules []weightedMod
 
@@ -36,9 +39,9 @@ type CustomWeightedStrategy struct {
 	trendPeriod        int // EMA period for trend filter (e.g., 50)
 
 	// Multi-timeframe filter: gate BUY with higher-TF EMA trend
-	htfEnabled bool   // enable higher-timeframe filter
+	htfEnabled  bool   // enable higher-timeframe filter
 	htfInterval string // e.g., "4h" (must match snapshot.HTFInterval)
-	htfPeriod  int    // EMA period on higher TF (e.g., 20 on 4h = 80h lookback)
+	htfPeriod   int    // EMA period on higher TF (e.g., 20 on 4h = 80h lookback)
 
 	// Signal confirmation
 	confirmBars  int
@@ -85,7 +88,58 @@ func (s *CustomWeightedStrategy) Name() string {
 	return "custom_weighted"
 }
 
+// Reconfigure hot-reloads strategy parameters. Thread-safe.
+// Resets trading state (cooldown, confirm count, etc.) since config changed.
+func (s *CustomWeightedStrategy) Reconfigure(cfg map[string]interface{}) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Reset trading state
+	s.confirmCount = 0
+	s.cooldownCount = 0
+	s.barsSinceEntry = 0
+	s.highWaterMark = 0
+	s.entryPrice = 0
+	s.weightedModules = nil // Clear modules before re-init
+
+	return s.init(cfg)
+}
+
+// GetConfig returns the current running configuration.
+func (s *CustomWeightedStrategy) GetConfig() map[string]interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	mods := make([]map[string]interface{}, 0, len(s.weightedModules))
+	for _, wm := range s.weightedModules {
+		mods = append(mods, map[string]interface{}{
+			"name":   wm.module.Name(),
+			"weight": wm.weight,
+		})
+	}
+
+	return map[string]interface{}{
+		"modules":        mods,
+		"buy_threshold":  s.buyThreshold,
+		"sell_threshold": s.sellThreshold,
+		"confirm_bars":   s.confirmBars,
+		"cooldown_bars":  s.cooldownBars,
+		"min_hold_bars":  s.minHoldBars,
+		"atr_stop_mult":  s.atrStopMult,
+		"atr_period":     s.atrPeriod,
+		"trend_filter":   s.trendFilterEnabled,
+		"trend_period":   s.trendPeriod,
+		"htf_enabled":    s.htfEnabled,
+		"htf_interval":   s.htfInterval,
+		"htf_period":     s.htfPeriod,
+	}
+}
+
 func (s *CustomWeightedStrategy) Init(cfg map[string]interface{}) error {
+	return s.init(cfg)
+}
+
+func (s *CustomWeightedStrategy) init(cfg map[string]interface{}) error {
 	// Parse control parameters
 	if v, ok := cfg["buy_threshold"]; ok {
 		s.buyThreshold = toFloat(v)
@@ -277,6 +331,9 @@ func (s *CustomWeightedStrategy) RequiredHistory() int {
 }
 
 func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.MarketSnapshot) (*strategy.Signal, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	sig := &strategy.Signal{
 		Action:     strategy.Hold,
 		Symbol:     snap.Symbol,
@@ -388,26 +445,26 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 		}
 
 		// Minimum hold period: don't sell too early (prevents signal flip-flop)
-		// No exceptions - let the position breathe
 		if s.minHoldBars > 0 && s.barsSinceEntry < s.minHoldBars {
 			return sig, nil
 		}
 
 		// Sell condition 1: ATR trailing stop (primary exit mechanism)
 		if atr > 0 && s.highWaterMark > 0 {
-			// Tighten stop only after substantial profit
 			mult := s.atrStopMult
+
+			// Profit-based tightening (existing logic, applied on top)
 			if s.entryPrice > 0 {
 				profitPct := (s.highWaterMark - s.entryPrice) / s.entryPrice * 100
 				if profitPct > 30 {
-					mult = s.atrStopMult * 0.65 // tighten at 30%+ profit
+					mult *= 0.65 // aggressive tighten at 30%+ profit
 				} else if profitPct > 15 {
-					mult = s.atrStopMult * 0.8 // moderate tighten at 15%+
+					mult *= 0.8 // moderate tighten at 15%+
 				}
-				// Below 15% profit: use full multiplier to let trades breathe
 			}
 
 			stopPrice := s.highWaterMark - atr*mult
+
 			if closePrice <= stopPrice {
 				sig.Action = strategy.Sell
 				sig.Strength = 0.8

@@ -74,6 +74,7 @@ func NewTrader(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*Tr
 	// Order manager
 	orderMgr := order.NewManager(ex, riskMgr, posMgr, store, bus, logger.Named("order"))
 	orderMgr.SetRiskConfig(cfg.Risk)
+	riskMgr.SetOrderCanceler(orderMgr, cfg.Exchange.Symbols)
 
 	// Strategy
 	strat, err := createStrategy(cfg.Strategy)
@@ -107,18 +108,34 @@ func (t *Trader) Run(ctx context.Context) error {
 		zap.String("strategy", t.strat.Name()),
 	)
 
-	// Initialize equity from account (skip if no API key configured)
+	// Initialize equity and sync positions from account
 	if t.cfg.Exchange.APIKey != "" {
 		acc, err := t.exchange.GetAccount(ctx)
 		if err != nil {
 			t.logger.Warn("failed to get initial account, continuing", zap.Error(err))
 		} else {
+			var usdtEquity float64
 			for _, b := range acc.Balances {
 				if b.Asset == "USDT" {
-					t.risk.SetEquity(b.Free + b.Locked)
+					usdtEquity = b.Free + b.Locked
 					break
 				}
 			}
+			// Paper 模式下账户余额可能很小，用 10000 作为最低初始权益
+			if t.cfg.App.Mode == "paper" && usdtEquity < 100 {
+				t.logger.Info("paper mode: using simulated initial equity", zap.Float64("actual_usdt", usdtEquity))
+				usdtEquity = 10000
+			}
+			t.risk.SetEquity(usdtEquity)
+			// Sync existing positions from Binance account
+			t.position.SyncFromAccount(acc.Balances, t.cfg.Exchange.Symbols, func(symbol string) float64 {
+				ticker, err := t.exchange.GetTicker(ctx, symbol)
+				if err != nil {
+					t.logger.Warn("get ticker for position sync", zap.String("symbol", symbol), zap.Error(err))
+					return 0
+				}
+				return ticker.LastPrice
+			})
 		}
 	} else {
 		t.logger.Warn("no API key configured, skipping account initialization")
@@ -192,6 +209,7 @@ func (t *Trader) Run(ctx context.Context) error {
 	}
 
 	// Telegram notifications
+	t.logger.Info("telegram config", zap.Bool("enabled", t.cfg.Telegram.Enabled), zap.String("chat_id", t.cfg.Telegram.ChatID))
 	if t.cfg.Telegram.Enabled {
 		tgCfg := notify.TelegramConfig{
 			Enabled: t.cfg.Telegram.Enabled,
@@ -480,6 +498,14 @@ func (t *Trader) saveSnapshot(ctx context.Context) {
 		}
 	}
 
+	// Update position prices before calculating equity
+	for _, sym := range t.cfg.Exchange.Symbols {
+		ticker, err := t.exchange.GetTicker(ctx, sym)
+		if err == nil && ticker.LastPrice > 0 {
+			t.position.UpdatePrice(sym, ticker.LastPrice)
+		}
+	}
+
 	positions := t.position.GetAllPositions()
 	posMap := make(map[string]float64)
 	posValue := 0.0
@@ -489,6 +515,14 @@ func (t *Trader) saveSnapshot(ctx context.Context) {
 	}
 
 	totalEquity := freeCash + posValue
+	// Paper 模式下若无持仓且余额极小，跳过风控更新防误触
+	if totalEquity < 1 {
+		t.logger.Debug("snapshot: equity near zero, skipping risk update",
+			zap.Float64("freeCash", freeCash),
+			zap.Float64("posValue", posValue),
+		)
+		return
+	}
 	unrealizedPnL := t.position.TotalUnrealizedPnL()
 	realizedPnL := t.position.TotalRealizedPnL()
 
@@ -505,6 +539,9 @@ func (t *Trader) saveSnapshot(ctx context.Context) {
 		DrawdownPct:   riskStatus.CurrentDrawdown,
 		Positions:     posMap,
 	}
+
+	// Update risk manager with live equity
+	t.risk.UpdateEquity(totalEquity)
 
 	if err := t.store.SaveSnapshot(ctx, snap); err != nil {
 		t.logger.Error("save snapshot", zap.Error(err))

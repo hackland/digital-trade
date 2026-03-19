@@ -61,6 +61,7 @@ func NewServer(deps *handler.Deps, logger *zap.Logger) *Server {
 		api.GET("/config", h.GetConfig)
 		api.GET("/ticker/:symbol", h.GetTicker)
 		api.POST("/backtest", h.RunBacktest)
+		api.POST("/strategy/deploy", h.DeployStrategy)
 		api.GET("/backtest/strategies", h.GetStrategies)
 		api.GET("/ws", hub.HandleWebSocket)
 	}

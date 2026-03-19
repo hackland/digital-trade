@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jayce/btc-trader/internal/eventbus"
+	"github.com/jayce/btc-trader/internal/exchange"
 	"go.uber.org/zap"
 )
 
@@ -109,13 +110,13 @@ func (n *TelegramNotifier) handleOrder(ctx context.Context, evt eventbus.Event) 
 	order := ou.Order
 	var emoji string
 	switch order.Status {
-	case "FILLED":
-		if order.Side == "BUY" {
+	case exchange.OrderStatusFilled:
+		if order.Side == exchange.OrderSideBuy {
 			emoji = "✅"
 		} else {
 			emoji = "💰"
 		}
-	case "CANCELED":
+	case exchange.OrderStatusCanceled:
 		emoji = "❌"
 	default:
 		return // Only notify on fills and cancels

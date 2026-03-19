@@ -22,10 +22,10 @@ type EngineConfig struct {
 	DynamicSize bool    // if true, scale position size by signal.Strength (AllocPct is max)
 
 	// Multi-timeframe support
-	HTFKlines   []exchange.Kline              // higher-timeframe klines (e.g., 4h)
-	HTFInterval string                        // e.g., "4h"
+	HTFKlines   []exchange.Kline                // higher-timeframe klines (e.g., 4h)
+	HTFInterval string                          // e.g., "4h"
 	HTFIndReqs  []strategy.IndicatorRequirement // indicator requirements for HTF
-	HTFHistSize int                           // minimum HTF klines needed
+	HTFHistSize int                             // minimum HTF klines needed
 }
 
 // Engine drives the backtest simulation.
@@ -328,6 +328,86 @@ func LoadKlinesFromStore(
 // KlineLoader is the minimal interface for loading klines.
 type KlineLoader interface {
 	GetKlines(ctx context.Context, symbol, interval string, start, end time.Time, limit int) ([]exchange.Kline, error)
+}
+
+// ExchangeKlineFetcher is the interface for fetching klines from an exchange.
+type ExchangeKlineFetcher interface {
+	GetKlines(ctx context.Context, req exchange.KlineRequest) ([]exchange.Kline, error)
+}
+
+// ExpectedKlineCount estimates the number of klines between start and end for a given interval.
+func ExpectedKlineCount(interval string, start, end time.Time) int {
+	dur := end.Sub(start)
+	switch interval {
+	case "1m":
+		return int(dur.Minutes())
+	case "5m":
+		return int(dur.Minutes() / 5)
+	case "15m":
+		return int(dur.Minutes() / 15)
+	case "1h":
+		return int(dur.Hours())
+	case "4h":
+		return int(dur.Hours() / 4)
+	case "1d":
+		return int(dur.Hours() / 24)
+	default:
+		return int(dur.Hours())
+	}
+}
+
+// FetchKlinesFromExchange fetches historical klines from the exchange API in batches.
+// Binance returns max 1000 per request, so we paginate.
+func FetchKlinesFromExchange(
+	ctx context.Context,
+	ex ExchangeKlineFetcher,
+	symbol, interval string,
+	start, end time.Time,
+) ([]exchange.Kline, error) {
+	var all []exchange.Kline
+	cursor := start
+	batchLimit := 1000
+
+	for cursor.Before(end) {
+		select {
+		case <-ctx.Done():
+			return all, ctx.Err()
+		default:
+		}
+
+		batchStart := cursor
+		batchEnd := end
+		batch, err := ex.GetKlines(ctx, exchange.KlineRequest{
+			Symbol:    symbol,
+			Interval:  interval,
+			StartTime: &batchStart,
+			EndTime:   &batchEnd,
+			Limit:     batchLimit,
+		})
+		if err != nil {
+			return all, fmt.Errorf("fetch klines batch: %w", err)
+		}
+		if len(batch) == 0 {
+			break
+		}
+
+		all = append(all, batch...)
+
+		// Move cursor past last kline
+		lastTime := batch[len(batch)-1].OpenTime
+		if !lastTime.After(cursor) {
+			// No progress, avoid infinite loop
+			break
+		}
+		cursor = lastTime.Add(time.Millisecond)
+
+		// If we got less than limit, we've reached the end
+		if len(batch) < batchLimit {
+			break
+		}
+	}
+
+	return all, nil
 }
 
 // findHTFWindow returns the slice of HTF klines up to (and including) the bar at or before ts.

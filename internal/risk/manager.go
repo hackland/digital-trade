@@ -33,6 +33,11 @@ type Status struct {
 	PauseUntil      time.Time `json:"pause_until,omitempty"`
 }
 
+// OrderCanceler is the interface for canceling orders (avoids circular import).
+type OrderCanceler interface {
+	CancelAllOrders(ctx context.Context, symbol string) error
+}
+
 // Manager orchestrates pre-trade and post-trade risk checks.
 type Manager struct {
 	cfg    config.RiskConfig
@@ -49,6 +54,9 @@ type Manager struct {
 	pauseReason     string
 	pauseUntil      time.Time
 	dayStart        time.Time
+
+	orderCanceler OrderCanceler
+	symbols       []string
 }
 
 // NewManager creates a new risk manager.
@@ -61,6 +69,14 @@ func NewManager(cfg config.RiskConfig, bus *eventbus.Bus, logger *zap.Logger) *M
 		logger:   logger,
 		dayStart: dayStart,
 	}
+}
+
+// SetOrderCanceler injects the order manager for emergency cancel on drawdown.
+func (m *Manager) SetOrderCanceler(oc OrderCanceler, symbols []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.orderCanceler = oc
+	m.symbols = symbols
 }
 
 // SetEquity sets the initial equity for risk calculations.
@@ -145,10 +161,31 @@ func (m *Manager) PostTradeCheck(ctx context.Context, trade *exchange.Trade) err
 	return nil
 }
 
+// UpdateEquity updates the current equity and peak for drawdown tracking.
+// Should be called on every position/trade update.
+func (m *Manager) UpdateEquity(equity float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.currentEquity = equity
+	if equity > m.peakEquity {
+		m.peakEquity = equity
+	}
+}
+
+// UpdateDailyPnL adds realized PnL to the daily tracker.
+func (m *Manager) UpdateDailyPnL(pnl float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dailyPnL += pnl
+}
+
 // ContinuousMonitor runs in a loop, checking for breached thresholds.
+// It also subscribes to position events to keep equity up to date.
 func (m *Manager) ContinuousMonitor(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+
+	posCh := m.bus.Subscribe(eventbus.EventPositionUpdate, 100)
 
 	for {
 		select {
@@ -157,19 +194,33 @@ func (m *Manager) ContinuousMonitor(ctx context.Context) error {
 		case <-ticker.C:
 			m.checkAndReset()
 			m.checkDrawdown()
+		case evt, ok := <-posCh:
+			if !ok {
+				return nil
+			}
+			if pu, ok := evt.Payload.(eventbus.PositionUpdateEvent); ok {
+				// Update daily PnL from realized gains
+				if pu.RealizedPnL != 0 {
+					// Note: this is cumulative, so we track the delta separately
+					_ = pu // equity is updated via UpdateEquity from snapshot loop
+				}
+			}
 		}
 	}
 }
 
-// PauseTrade pauses all trading with a reason.
+// PauseTrade pauses all trading with a reason and cancels open orders.
 func (m *Manager) PauseTrade(reason string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.isPaused = true
 	m.pauseReason = reason
 	if m.cfg.DrawdownCooldownMins > 0 {
 		m.pauseUntil = time.Now().Add(time.Duration(m.cfg.DrawdownCooldownMins) * time.Minute)
 	}
+	oc := m.orderCanceler
+	symbols := m.symbols
+	m.mu.Unlock()
+
 	m.logger.Warn("trading paused", zap.String("reason", reason))
 	m.bus.Publish(eventbus.Event{
 		Type:      eventbus.EventRiskAlert,
@@ -180,6 +231,19 @@ func (m *Manager) PauseTrade(reason string) {
 			Level:   "critical",
 		},
 	})
+
+	// Emergency: cancel all open orders
+	if oc != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		for _, sym := range symbols {
+			if err := oc.CancelAllOrders(ctx, sym); err != nil {
+				m.logger.Error("emergency cancel orders", zap.String("symbol", sym), zap.Error(err))
+			} else {
+				m.logger.Warn("emergency canceled all orders", zap.String("symbol", sym))
+			}
+		}
+	}
 }
 
 // ResumeTrade resumes trading.
