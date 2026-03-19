@@ -46,6 +46,12 @@ type MarketSnapshot struct {
 	OrderBook  *exchange.OrderBook
 	Position   *PositionInfo
 	Timestamp  time.Time
+
+	// Higher-timeframe data for multi-TF strategies (optional).
+	// Populated when htf_interval is configured (e.g., "4h").
+	HTFKlines     []exchange.Kline // higher-timeframe klines (e.g., 4h)
+	HTFIndicators IndicatorSet     // indicators computed on HTF klines
+	HTFInterval   string           // e.g., "4h"
 }
 
 // PositionInfo provides current position state to the strategy.
@@ -69,9 +75,14 @@ type IndicatorSet struct {
 	VWAP float64
 
 	// Volume-based indicators
-	CMF       map[int]float64 // period -> value (-1 to +1)
-	ADL       float64         // Accumulation/Distribution Line
-	VolumeSMA map[int]float64 // period -> volume moving average
+	CMF        map[int]float64 // period -> value (-1 to +1)
+	ADL        float64         // Accumulation/Distribution Line
+	VolumeSMA  map[int]float64 // period -> volume moving average
+	VROC       map[int]float64 // period -> volume rate of change (%)
+	ForceIndex map[int]float64 // period -> EMA-smoothed force index
+
+	// KDJ (Stochastic)
+	KDJ KDJValue
 }
 
 // MACDValue holds MACD indicator components.
@@ -87,6 +98,13 @@ type BollingerBands struct {
 	Middle float64
 	Lower  float64
 	Width  float64
+}
+
+// KDJValue holds KDJ (Stochastic) indicator components.
+type KDJValue struct {
+	K float64 // fast stochastic
+	D float64 // slow stochastic
+	J float64 // 3K - 2D
 }
 
 // IndicatorRequirement specifies an indicator that a strategy needs.

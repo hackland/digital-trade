@@ -57,6 +57,7 @@ func NewServer(deps *handler.Deps, logger *zap.Logger) *Server {
 		api.GET("/klines", h.GetKlines)
 		api.GET("/risk/status", h.GetRiskStatus)
 		api.GET("/strategy/status", h.GetStrategyStatus)
+		api.GET("/indicator/modules", h.GetIndicatorModules)
 		api.GET("/config", h.GetConfig)
 		api.GET("/ticker/:symbol", h.GetTicker)
 		api.POST("/backtest", h.RunBacktest)

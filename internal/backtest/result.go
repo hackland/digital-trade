@@ -19,6 +19,8 @@ type Result struct {
 	EndTime     time.Time     `json:"end_time"`
 	Duration    time.Duration `json:"duration"`
 	InitialCash float64       `json:"initial_cash"`
+	FeeRate     float64       `json:"fee_rate"`  // actual fee rate used (e.g., 0.001 = 0.1%)
+	AllocPct    float64       `json:"alloc_pct"` // actual allocation fraction used (e.g., 0.1 = 10%)
 
 	// Trade history
 	Trades []TradeRecord `json:"trades"`
@@ -198,16 +200,18 @@ func ComputeMetrics(trades []*exchange.Trade, equityCurve []EquityPoint, initial
 	return m
 }
 
-// computeRoundTrips groups buy→sell trades into round trips and returns PnL list.
+// computeRoundTrips groups buy→sell trades into round trips and returns net PnL list (after fees).
 func computeRoundTrips(trades []*exchange.Trade) []float64 {
 	var roundTrips []float64
 	var buyAvg float64
 	var buyQty float64
+	var buyFees float64 // accumulated buy fees for current position
 
 	for _, t := range trades {
 		if t.Side == exchange.OrderSideBuy {
 			// Weighted average entry price
 			totalCost := buyAvg*buyQty + t.Price*t.Quantity
+			buyFees += t.Fee
 			buyQty += t.Quantity
 			if buyQty > 0 {
 				buyAvg = totalCost / buyQty
@@ -218,12 +222,18 @@ func computeRoundTrips(trades []*exchange.Trade) []float64 {
 				sellQty = buyQty
 			}
 			if sellQty > 0 {
-				pnl := (t.Price - buyAvg) * sellQty
-				roundTrips = append(roundTrips, pnl)
+				grossPnL := (t.Price - buyAvg) * sellQty
+				// Proportional buy fee for partial sells
+				sellFraction := sellQty / buyQty
+				allocBuyFee := buyFees * sellFraction
+				netPnL := grossPnL - allocBuyFee - t.Fee
+				roundTrips = append(roundTrips, netPnL)
 				buyQty -= sellQty
+				buyFees -= allocBuyFee
 				if buyQty <= 0 {
 					buyQty = 0
 					buyAvg = 0
+					buyFees = 0
 				}
 			}
 		}

@@ -54,13 +54,17 @@ type CompositeScoreStrategy struct {
 	trailingStopPct float64 // e.g., 0.03 = 3% trailing stop
 	highWaterMark   float64 // track highest price since entry
 
+	// Anti-whipsaw controls
+	minBarsSell    int     // minimum bars held before strategy-level sell allowed
+	emaDeadZonePct float64 // EMA crossover dead zone (e.g., 0.002 = 0.2%)
+
 	// State
-	prevFastEMA  float64
-	prevSlowEMA  float64
-	prevRSI      float64
-	prevMFI      float64
-	entryPrice   float64
-	initialized  bool
+	prevFastEMA    float64
+	prevSlowEMA    float64
+	prevRSI        float64
+	prevMFI        float64
+	entryPrice     float64
+	initialized    bool
 	barsSinceEntry int
 }
 
@@ -81,8 +85,10 @@ func NewCompositeScoreStrategy() *CompositeScoreStrategy {
 		weightVolume:    0.15,
 		weightCMF:       0.15,
 		buyThreshold:    0.4,
-		sellThreshold:   -0.3,
-		trailingStopPct: 0.025, // 2.5% trailing stop
+		sellThreshold:   -0.4,
+		trailingStopPct: 0.03,   // 3% trailing stop (适配1h框架)
+		minBarsSell:     3,      // 至少持仓3根K线
+		emaDeadZonePct:  0.002,  // EMA交叉死区 0.2%
 	}
 }
 
@@ -138,6 +144,12 @@ func (s *CompositeScoreStrategy) Init(cfg map[string]interface{}) error {
 	}
 	if v, ok := cfg["trailing_stop_pct"]; ok {
 		s.trailingStopPct = toFloat(v)
+	}
+	if v, ok := cfg["min_bars_before_sell"]; ok {
+		s.minBarsSell = toInt(v)
+	}
+	if v, ok := cfg["ema_dead_zone_pct"]; ok {
+		s.emaDeadZonePct = toFloat(v)
 	}
 	return nil
 }
@@ -264,7 +276,7 @@ func (s *CompositeScoreStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 			s.highWaterMark = closePrice
 		}
 
-		// SELL condition 1: Trailing stop
+		// SELL condition 1: Trailing stop (always active, ignores minBarsSell)
 		if s.trailingStopPct > 0 && s.highWaterMark > 0 {
 			dropPct := (s.highWaterMark - closePrice) / s.highWaterMark
 			if dropPct >= s.trailingStopPct {
@@ -277,24 +289,28 @@ func (s *CompositeScoreStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 			}
 		}
 
+		// Strategy-level sells require minimum holding period to avoid whipsaws.
+		// Trailing stop (above) and exchange-level SL/TP are NOT affected.
+		canStrategySell := s.barsSinceEntry >= s.minBarsSell
+
 		// SELL condition 2: Composite score deeply negative
-		if sig.Action != strategy.Sell && composite <= s.sellThreshold {
+		if sig.Action != strategy.Sell && canStrategySell && composite <= s.sellThreshold {
 			sig.Action = strategy.Sell
 			sig.Strength = clamp(-composite, 0.1, 1.0)
 			sig.Reason = fmt.Sprintf(
-				"Composite sell (score=%.2f): %s",
-				composite, s.formatScores(scores),
+				"Composite sell (score=%.2f, bars=%d): %s",
+				composite, s.barsSinceEntry, s.formatScores(scores),
 			)
 		}
 
 		// SELL condition 3: Strong reversal signals (any single indicator extreme)
-		if sig.Action != strategy.Sell {
+		if sig.Action != strategy.Sell && canStrategySell {
 			if rsi > 80 && mfi > 80 {
 				sig.Action = strategy.Sell
 				sig.Strength = 0.7
 				sig.Reason = fmt.Sprintf(
-					"Extreme overbought exit: RSI=%.1f, MFI=%.1f",
-					rsi, mfi,
+					"Extreme overbought exit: RSI=%.1f, MFI=%.1f (bars=%d)",
+					rsi, mfi, s.barsSinceEntry,
 				)
 			}
 		}
@@ -312,7 +328,8 @@ func (s *CompositeScoreStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 // --- Score computation functions ---
 // Each returns a value from -1.0 (strong sell) to +1.0 (strong buy)
 
-// computeTrendScore: EMA alignment and price position
+// computeTrendScore: EMA alignment and price position.
+// Includes a dead zone around EMA crossover to prevent whipsaw signals.
 func (s *CompositeScoreStrategy) computeTrendScore(fastEMA, slowEMA, close float64) float64 {
 	if slowEMA == 0 {
 		return 0
@@ -331,11 +348,19 @@ func (s *CompositeScoreStrategy) computeTrendScore(fastEMA, slowEMA, close float
 		score += clamp(priceVsEMA*25, -0.3, 0.3)
 	}
 
-	// Crossover momentum: was fast below slow, now above (or vice versa)
-	if s.prevFastEMA <= s.prevSlowEMA && fastEMA > slowEMA {
-		score += 0.2 // golden cross bonus
-	} else if s.prevFastEMA >= s.prevSlowEMA && fastEMA < slowEMA {
-		score -= 0.2 // death cross penalty
+	// Crossover momentum with dead zone buffer:
+	// Only count as a real crossover if the EMA separation exceeds the dead zone.
+	// This prevents rapid flip-flopping when price oscillates around EMA.
+	deadZone := s.emaDeadZonePct * slowEMA // absolute dead zone in price units
+	prevBullish := s.prevFastEMA > s.prevSlowEMA+deadZone
+	prevBearish := s.prevFastEMA < s.prevSlowEMA-deadZone
+	nowBullish := fastEMA > slowEMA+deadZone
+	nowBearish := fastEMA < slowEMA-deadZone
+
+	if !prevBullish && nowBullish {
+		score += 0.2 // confirmed golden cross (outside dead zone)
+	} else if !prevBearish && nowBearish {
+		score -= 0.2 // confirmed death cross (outside dead zone)
 	}
 
 	return clamp(score, -1.0, 1.0)

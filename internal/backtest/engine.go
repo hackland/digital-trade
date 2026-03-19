@@ -19,6 +19,13 @@ type EngineConfig struct {
 	InitialCash float64
 	FeeRate     float64 // e.g., 0.001 = 0.1%
 	AllocPct    float64 // fraction of equity to allocate per trade (e.g., 0.1 = 10%)
+	DynamicSize bool    // if true, scale position size by signal.Strength (AllocPct is max)
+
+	// Multi-timeframe support
+	HTFKlines   []exchange.Kline              // higher-timeframe klines (e.g., 4h)
+	HTFInterval string                        // e.g., "4h"
+	HTFIndReqs  []strategy.IndicatorRequirement // indicator requirements for HTF
+	HTFHistSize int                           // minimum HTF klines needed
 }
 
 // Engine drives the backtest simulation.
@@ -61,7 +68,7 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 	symbol := e.cfg.Symbol
 	allocPct := e.cfg.AllocPct
 	if allocPct <= 0 {
-		allocPct = 0.1 // default 10%
+		allocPct = 0.9 // default 90% for single-asset backtesting
 	}
 
 	e.logger.Info("backtest starting",
@@ -107,6 +114,18 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 			Timestamp:  currentBar.OpenTime,
 		}
 
+		// Attach HTF data if configured
+		if len(e.cfg.HTFKlines) > 0 && e.cfg.HTFHistSize > 0 {
+			htfWindow := e.findHTFWindow(currentBar.OpenTime)
+			if len(htfWindow) >= e.cfg.HTFHistSize {
+				snapshot.HTFKlines = htfWindow
+				snapshot.HTFInterval = e.cfg.HTFInterval
+				if len(e.cfg.HTFIndReqs) > 0 {
+					snapshot.HTFIndicators = e.indComp.ComputeAll(htfWindow, e.cfg.HTFIndReqs)
+				}
+			}
+		}
+
 		// Evaluate strategy
 		sig, err := e.strat.Evaluate(ctx, snapshot)
 		if err != nil {
@@ -118,8 +137,25 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 		if sig.Action == strategy.Buy && positionQty == 0 {
 			// Get current balance
 			bal, _ := e.exchange.GetBalance(ctx, "USDT")
-			allocUSDT := bal.Free * allocPct
-			qty := allocUSDT / currentBar.Close
+			effectiveAlloc := allocPct
+			e.logger.Debug("buy signal",
+				zap.Float64("balance", bal.Free),
+				zap.Float64("alloc_pct", effectiveAlloc),
+				zap.Float64("alloc_usdt", bal.Free*effectiveAlloc),
+				zap.Float64("price", currentBar.Close),
+			)
+			if e.cfg.DynamicSize && sig.Strength > 0 {
+				// Scale: 50% strength → 50% of allocPct, 100% → full allocPct
+				// Minimum 30% of allocPct to avoid dust orders
+				effectiveAlloc = allocPct * clampFloat(sig.Strength, 0.3, 1.0)
+			}
+			allocUSDT := bal.Free * effectiveAlloc
+			// Reserve fee in sizing so alloc=1 with fee>0 can still be filled.
+			denom := currentBar.Close * (1 + e.cfg.FeeRate)
+			if denom <= 0 {
+				continue
+			}
+			qty := allocUSDT / denom
 
 			if qty > 0 {
 				order, err := e.exchange.PlaceOrder(ctx, exchange.OrderRequest{
@@ -133,6 +169,14 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 				} else if order.Status == exchange.OrderStatusFilled {
 					positionQty = order.FilledQty
 					avgEntryPrice = order.AvgPrice
+
+					// Notify strategy: sets entryPrice, highWaterMark, resets counters
+					e.strat.OnTradeExecuted(&exchange.Trade{
+						Symbol:   symbol,
+						Side:     exchange.OrderSideBuy,
+						Price:    order.AvgPrice,
+						Quantity: order.FilledQty,
+					})
 
 					tradeRecords = append(tradeRecords, TradeRecord{
 						Timestamp: currentBar.OpenTime,
@@ -155,6 +199,14 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 				e.logger.Warn("sell failed", zap.Error(err))
 			} else if order.Status == exchange.OrderStatusFilled {
 				pnl := (order.AvgPrice - avgEntryPrice) * positionQty
+
+				// Notify strategy: starts cooldown, resets tracking
+				e.strat.OnTradeExecuted(&exchange.Trade{
+					Symbol:   symbol,
+					Side:     exchange.OrderSideSell,
+					Price:    order.AvgPrice,
+					Quantity: order.FilledQty,
+				})
 
 				tradeRecords = append(tradeRecords, TradeRecord{
 					Timestamp: currentBar.OpenTime,
@@ -190,6 +242,14 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 		})
 		if err == nil && order.Status == exchange.OrderStatusFilled {
 			pnl := (lastPrice - avgEntryPrice) * positionQty
+
+			e.strat.OnTradeExecuted(&exchange.Trade{
+				Symbol:   symbol,
+				Side:     exchange.OrderSideSell,
+				Price:    order.AvgPrice,
+				Quantity: order.FilledQty,
+			})
+
 			tradeRecords = append(tradeRecords, TradeRecord{
 				Timestamp: klines[len(klines)-1].OpenTime,
 				Side:      "SELL",
@@ -227,6 +287,8 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 		EndTime:     endTime,
 		Duration:    duration,
 		InitialCash: e.cfg.InitialCash,
+		FeeRate:     e.cfg.FeeRate,
+		AllocPct:    allocPct,
 		Trades:      tradeRecords,
 		Metrics:     metrics,
 		EquityCurve: equityCurve,
@@ -266,4 +328,33 @@ func LoadKlinesFromStore(
 // KlineLoader is the minimal interface for loading klines.
 type KlineLoader interface {
 	GetKlines(ctx context.Context, symbol, interval string, start, end time.Time, limit int) ([]exchange.Kline, error)
+}
+
+// findHTFWindow returns the slice of HTF klines up to (and including) the bar at or before ts.
+func (e *Engine) findHTFWindow(ts time.Time) []exchange.Kline {
+	idx := -1
+	for i := len(e.cfg.HTFKlines) - 1; i >= 0; i-- {
+		if !e.cfg.HTFKlines[i].OpenTime.After(ts) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil
+	}
+	start := 0
+	if idx-e.cfg.HTFHistSize*2 > 0 {
+		start = idx - e.cfg.HTFHistSize*2
+	}
+	return e.cfg.HTFKlines[start : idx+1]
+}
+
+func clampFloat(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }

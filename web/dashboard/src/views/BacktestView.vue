@@ -21,16 +21,6 @@
             <el-option v-for="s in strategies" :key="s.name" :label="s.label" :value="s.name" />
           </el-select>
         </el-form-item>
-        <el-form-item v-if="isManualComposite" label="Price Strategy">
-          <el-select v-model="form.price_strategy" style="width: 190px">
-            <el-option v-for="s in priceStrategyOptions" :key="s.name" :label="s.label" :value="s.name" />
-          </el-select>
-        </el-form-item>
-        <el-form-item v-if="isManualComposite" label="Volume Strategy">
-          <el-select v-model="form.volume_strategy" style="width: 210px">
-            <el-option v-for="s in volumeStrategyOptions" :key="s.name" :label="s.label" :value="s.name" />
-          </el-select>
-        </el-form-item>
         <el-form-item label="Initial Cash">
           <el-input-number v-model="form.cash" :min="100" :step="1000" style="width: 140px" />
         </el-form-item>
@@ -41,6 +31,124 @@
           <el-input-number v-model="feePct" :min="0" :max="100" :step="0.01" :precision="2" style="width: 110px" />
         </el-form-item>
       </el-form>
+
+      <!-- Custom Weighted Config Panel -->
+      <div v-if="isCustomWeighted" class="custom-weighted-panel">
+        <div class="cw-section" v-for="cat in categoryOrder" :key="cat">
+          <div class="cw-category-title">{{ categoryLabels[cat] || cat }}</div>
+          <div v-for="mod in groupedModules[cat]" :key="mod.name" class="cw-module-row">
+            <el-checkbox
+              v-model="enabledModules[mod.name]"
+              @change="onModuleToggle(mod.name)"
+              class="cw-checkbox"
+            >
+              <span class="cw-mod-label">{{ mod.label }}</span>
+            </el-checkbox>
+            <el-tooltip :content="mod.description" placement="top">
+              <el-icon class="cw-info-icon"><QuestionFilled /></el-icon>
+            </el-tooltip>
+            <div class="cw-weight-area" v-if="enabledModules[mod.name]">
+              <el-slider
+                v-model="moduleWeights[mod.name]"
+                :min="0" :max="100" :step="5"
+                :show-tooltip="false"
+                style="width: 120px"
+                size="small"
+              />
+              <span class="cw-weight-val">{{ moduleWeights[mod.name] }}%</span>
+            </div>
+            <!-- Module params -->
+            <div class="cw-params" v-if="enabledModules[mod.name] && mod.params?.length">
+              <span v-for="p in mod.params" :key="p.key" class="cw-param-item">
+                <span class="cw-param-label">{{ p.label }}:</span>
+                <el-input-number
+                  v-model="moduleParams[mod.name][p.key]"
+                  :min="p.min" :max="p.max" :step="p.step"
+                  size="small"
+                  controls-position="right"
+                  style="width: 90px"
+                />
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Signal controls - grouped -->
+        <div class="cw-section">
+          <div class="cw-category-title" style="display: flex; align-items: center; gap: 12px">
+            信号控制
+            <div class="cw-preset-btns">
+              <el-button
+                v-for="(preset, key) in signalPresets"
+                :key="key"
+                :type="activePreset === key ? 'warning' : 'default'"
+                size="small"
+                @click="applyPreset(key as string)"
+                :style="activePreset === key
+                  ? 'background: #f0b90b; border-color: #f0b90b; color: #000; font-size: 12px'
+                  : 'background: #252526; border-color: #444; color: #b0b0b0; font-size: 12px'"
+              >
+                {{ preset.label }}
+              </el-button>
+            </div>
+          </div>
+
+          <div class="cw-signal-groups">
+            <div v-for="grp in signalGroups" :key="grp.key" class="cw-signal-group">
+              <div class="cw-group-header">{{ grp.label }}</div>
+              <div class="cw-group-params">
+                <div v-for="sp in getParamsByGroup(grp.key)" :key="sp.key" class="cw-signal-param">
+                  <div class="cw-signal-param-top">
+                    <span class="cw-signal-param-label">{{ sp.label }}</span>
+                    <el-tooltip v-if="sp.desc" :content="sp.desc" placement="top" :show-after="200">
+                      <el-icon class="cw-info-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </div>
+                  <el-switch
+                    v-if="sp.type === 'bool'"
+                    v-model="signalConfig[sp.key]"
+                    size="small"
+                    @change="activePreset = ''"
+                  />
+                  <el-select
+                    v-else-if="sp.type === 'string'"
+                    v-model="signalConfig[sp.key]"
+                    size="small"
+                    style="width: 80px"
+                    @change="activePreset = ''"
+                  >
+                    <el-option label="1h" value="1h" />
+                    <el-option label="4h" value="4h" />
+                    <el-option label="1d" value="1d" />
+                  </el-select>
+                  <el-input-number
+                    v-else
+                    v-model="signalConfig[sp.key]"
+                    :min="sp.min" :max="sp.max" :step="sp.step"
+                    :precision="sp.type === 'float' ? 2 : 0"
+                    size="small"
+                    controls-position="right"
+                    style="width: 100px"
+                    @change="activePreset = ''"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Weight summary -->
+        <div class="cw-weight-summary">
+          <span>权重合计: </span>
+          <span :style="{ color: totalWeight === 100 ? '#67C23A' : '#F56C6C', fontWeight: 600 }">
+            {{ totalWeight }}%
+          </span>
+          <span v-if="totalWeight !== 100" style="color: #F56C6C; margin-left: 8px; font-size: 12px">
+            (建议调整至 100%)
+          </span>
+          <el-button size="small" text type="info" @click="resetModules" style="margin-left: 12px">重置默认</el-button>
+        </div>
+      </div>
 
       <!-- Time Range Row -->
       <div class="time-range-row">
@@ -164,6 +272,9 @@
             <div class="detail-grid">
               <div class="detail-row"><span>Initial Cash</span><span>${{ result.initial_cash.toFixed(2) }}</span></div>
               <div class="detail-row"><span>Final Equity</span><span>${{ result.metrics.final_equity.toFixed(2) }}</span></div>
+              <div class="detail-row"><span>Gross PnL</span><span :style="{ color: grossPnl >= 0 ? '#67C23A' : '#F56C6C' }">${{ grossPnl.toFixed(2) }}</span></div>
+              <div class="detail-row"><span>Fee Rate</span><span>{{ ((result.fee_rate || 0) * 100).toFixed(2) }}%</span></div>
+              <div class="detail-row"><span>Alloc</span><span>{{ ((result.alloc_pct || 0) * 100).toFixed(0) }}%</span></div>
               <div class="detail-row"><span>Total Fees</span><span>${{ result.metrics.total_fees.toFixed(2) }}</span></div>
               <div class="detail-row"><span>Avg Win</span><span style="color: #67C23A">${{ result.metrics.avg_win.toFixed(2) }}</span></div>
               <div class="detail-row"><span>Avg Loss</span><span style="color: #F56C6C">${{ result.metrics.avg_loss.toFixed(2) }}</span></div>
@@ -238,13 +349,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { createChart, type IChartApi, type ISeriesApi, ColorType } from 'lightweight-charts'
-import { runBacktest as apiRunBacktest, getStrategies, type BacktestRequest, type BacktestResult, type StrategyInfo } from '@/api/backtest'
+import { runBacktest as apiRunBacktest, getStrategies, getIndicatorModules, type BacktestRequest, type BacktestResult, type StrategyInfo, type ModuleMeta, type ParamSchema, type SignalPreset } from '@/api/backtest'
 import { fetchKlines } from '@/api/klines'
 import { SYMBOLS, INTERVALS } from '@/utils/constants'
 import { formatPrice, formatTime } from '@/utils/format'
 import { ElMessage } from 'element-plus'
+import { QuestionFilled } from '@element-plus/icons-vue'
 
 // --- Day presets ---
 const dayPresets = [
@@ -257,10 +369,10 @@ const dayPresets = [
 
 const form = ref({
   symbol: 'BTCUSDT',
-  interval: '5m',
-  strategy: 'ema_crossover',
-  price_strategy: 'ema_crossover',
-  volume_strategy: 'volume_trend',
+  interval: '1h',
+  strategy: 'custom_weighted',
+  price_strategy: '',
+  volume_strategy: '',
   cash: 10000,
 })
 
@@ -268,31 +380,174 @@ const activeDays = ref(30)
 const useCustomRange = ref(false)
 const dateRange = ref<[string, string] | null>(null)
 
-const allocPct = ref(10)
+const allocPct = ref(100)
 const feePct = ref(0.1)
 const loading = ref(false)
 const result = ref<BacktestResult | null>(null)
 const selectedTradeIndex = ref<number | null>(null)
 const strategies = ref<StrategyInfo[]>([
-  { name: 'ema_crossover', label: 'EMA Crossover' },
-  { name: 'macd_rsi', label: 'MACD + RSI' },
-  { name: 'bb_breakout', label: 'Bollinger Bands Breakout' },
-  { name: 'vwap_reversion', label: 'VWAP Mean Reversion' },
-  { name: 'volume_trend', label: 'Volume Trend' },
-  { name: 'composite_score', label: 'Composite Score (Multi-Indicator)' },
-  { name: 'manual_composite', label: 'Manual Composite (Price + Volume)' },
+  { name: 'custom_weighted', label: '自定义加权 (Custom Weighted)' },
 ])
-const priceStrategyOptions: StrategyInfo[] = [
-  { name: 'ema_crossover', label: 'EMA Crossover' },
-  { name: 'macd_rsi', label: 'MACD + RSI' },
-  { name: 'bb_breakout', label: 'Bollinger Bands Breakout' },
-]
-const volumeStrategyOptions: StrategyInfo[] = [
-  { name: 'volume_trend', label: 'Volume Trend' },
-  { name: 'vwap_reversion', label: 'VWAP Mean Reversion' },
-  { name: 'composite_score', label: 'Composite Score (Multi-Indicator)' },
-]
 const isManualComposite = ref(false)
+const isCustomWeighted = ref(true)
+
+// --- Custom Weighted Module Config ---
+const categoryOrder = ['trend', 'momentum', 'money_flow', 'volume']
+const categoryLabels: Record<string, string> = {
+  trend: '趋势类',
+  momentum: '动量类',
+  money_flow: '资金流类',
+  volume: '成交量类',
+}
+
+const groupedModules = ref<Record<string, ModuleMeta[]>>({})
+const signalParams = ref<ParamSchema[]>([])
+const enabledModules = ref<Record<string, boolean>>({})
+const moduleWeights = ref<Record<string, number>>({})
+const moduleParams = ref<Record<string, Record<string, any>>>({})
+const signalConfig = ref<Record<string, any>>({})
+const signalPresets = ref<Record<string, SignalPreset>>({})
+const activePreset = ref('')
+
+const signalGroups = [
+  { key: 'signal', label: '买卖信号' },
+  { key: 'position', label: '持仓控制' },
+  { key: 'stoploss', label: '止损' },
+  { key: 'trend', label: '趋势过滤' },
+]
+
+function getParamsByGroup(group: string): ParamSchema[] {
+  return signalParams.value.filter(sp => sp.group === group)
+}
+
+function applyPreset(key: string) {
+  const preset = signalPresets.value[key]
+  if (!preset) return
+  for (const sp of signalParams.value) {
+    if (sp.key in preset) {
+      signalConfig.value[sp.key] = preset[sp.key]
+    }
+  }
+  activePreset.value = key
+}
+
+const grossPnl = computed(() => {
+  if (!result.value?.trades) return 0
+  return result.value.trades.reduce((sum, t) => sum + (t.pnl || 0), 0)
+})
+
+const totalWeight = computed(() => {
+  let sum = 0
+  for (const [name, enabled] of Object.entries(enabledModules.value)) {
+    if (enabled) sum += (moduleWeights.value[name] || 0)
+  }
+  return sum
+})
+
+let allModules: ModuleMeta[] = []
+
+const fallbackSignalParams: ParamSchema[] = [
+  { key: 'buy_threshold', label: '买入阈值', type: 'float', default: 0.20, min: 0.05, max: 0.8, step: 0.05, group: 'signal', desc: '综合评分超过此值才触发买入，越高越严格' },
+  { key: 'sell_threshold', label: '卖出阈值', type: 'float', default: -0.30, min: -1.0, max: -0.1, step: 0.05, group: 'signal', desc: '综合评分低于此值触发卖出，越低越宽松' },
+  { key: 'confirm_bars', label: '确认K线数', type: 'int', default: 1, min: 1, max: 5, step: 1, group: 'signal', desc: '连续N根K线评分达标才买入，防止假信号' },
+  { key: 'cooldown_bars', label: '冷却期', type: 'int', default: 12, min: 0, max: 48, step: 1, group: 'position', desc: '卖出后等待N根K线才允许再次买入' },
+  { key: 'min_hold_bars', label: '最短持仓', type: 'int', default: 6, min: 0, max: 30, step: 1, group: 'position', desc: '买入后至少持有N根K线，避免频繁交易' },
+  { key: 'atr_stop_mult', label: 'ATR止损倍数', type: 'float', default: 3.0, min: 1.0, max: 6.0, step: 0.1, group: 'stoploss', desc: '追踪止损距离 = ATR × 倍数，越大越宽松' },
+  { key: 'trend_filter', label: 'EMA趋势过滤', type: 'bool', default: false, min: 0, max: 1, step: 1, group: 'trend', desc: '开启后只在价格高于EMA均线时买入，过滤下跌趋势' },
+  { key: 'trend_period', label: 'EMA周期', type: 'int', default: 50, min: 20, max: 200, step: 5, group: 'trend', desc: '趋势判断用的均线周期，50表示看50根K线趋势' },
+  { key: 'htf_enabled', label: '大周期过滤', type: 'bool', default: true, min: 0, max: 1, step: 1, group: 'trend', desc: '开启后用更大时间周期(如4h)确认趋势方向' },
+  { key: 'htf_interval', label: '大周期', type: 'string', default: '1d', min: 0, max: 0, step: 0, group: 'trend', desc: '用于趋势确认的大时间框架' },
+  { key: 'htf_period', label: '大周期EMA', type: 'int', default: 10, min: 10, max: 100, step: 5, group: 'trend', desc: '大周期上的EMA均线周期' },
+]
+
+const fallbackPresets: Record<string, SignalPreset> = {
+  conservative: { label: '保守', desc: '低频交易，高确认，严格过滤', buy_threshold: 0.30, sell_threshold: -0.30, confirm_bars: 2, cooldown_bars: 24, min_hold_bars: 12, atr_stop_mult: 3.5, trend_filter: false, trend_period: 50, htf_enabled: true, htf_interval: '1d', htf_period: 10 },
+  standard: { label: '标准', desc: '推荐配置: EMA+MACD+MFI, 日线过滤', buy_threshold: 0.20, sell_threshold: -0.30, confirm_bars: 1, cooldown_bars: 12, min_hold_bars: 6, atr_stop_mult: 3.0, trend_filter: false, trend_period: 50, htf_enabled: true, htf_interval: '1d', htf_period: 10 },
+  aggressive: { label: '激进', desc: '低阈值、快进快出，交易频率高', buy_threshold: 0.10, sell_threshold: -0.15, confirm_bars: 1, cooldown_bars: 2, min_hold_bars: 3, atr_stop_mult: 2.0, trend_filter: false, trend_period: 30, htf_enabled: true, htf_interval: '1d', htf_period: 10 },
+}
+
+function mergeSignalParams(apiParams: ParamSchema[]): ParamSchema[] {
+  // Merge group/desc/label from fallback if API doesn't have them
+  const fallbackMap = new Map(fallbackSignalParams.map(p => [p.key, p]))
+  return apiParams.map(sp => {
+    const fb = fallbackMap.get(sp.key)
+    if (!fb) return { ...sp, group: sp.group || 'signal', desc: sp.desc || '' }
+    return {
+      ...sp,
+      label: fb.label,  // always prefer our cleaner labels
+      group: sp.group || fb.group || 'signal',
+      desc: sp.desc || fb.desc || '',
+    }
+  })
+}
+
+async function loadModules() {
+  try {
+    const data = await getIndicatorModules()
+    allModules = data.modules
+    groupedModules.value = data.grouped
+    signalParams.value = data.signal_params?.length
+      ? mergeSignalParams(data.signal_params)
+      : fallbackSignalParams
+    signalPresets.value = data.signal_presets || fallbackPresets
+  } catch {
+    signalParams.value = fallbackSignalParams
+    signalPresets.value = fallbackPresets
+  }
+  resetModules()
+  activePreset.value = 'standard'
+}
+
+function resetModules() {
+  enabledModules.value = {}
+  moduleWeights.value = {}
+  moduleParams.value = {}
+  signalConfig.value = {}
+
+  // 推荐策略: EMA金叉40% + MACD40% + MFI资金流量20%
+  const defaultModules: Record<string, number> = {
+    'ema_cross': 40,
+    'macd': 40,
+    'mfi': 20,
+  }
+  for (const mod of allModules) {
+    enabledModules.value[mod.name] = mod.name in defaultModules
+    moduleWeights.value[mod.name] = defaultModules[mod.name] ?? Math.round(mod.default_weight * 100)
+    const params: Record<string, any> = {}
+    for (const p of (mod.params || [])) {
+      params[p.key] = p.default
+    }
+    moduleParams.value[mod.name] = params
+  }
+
+  for (const sp of signalParams.value) {
+    signalConfig.value[sp.key] = sp.default
+  }
+}
+
+function onModuleToggle(name: string) {
+  if (!enabledModules.value[name]) {
+    // Just disabled, weight stays for re-enable
+  }
+}
+
+function buildStrategyConfig(): Record<string, any> {
+  const mods: any[] = []
+  for (const [name, enabled] of Object.entries(enabledModules.value)) {
+    if (!enabled) continue
+    const weight = (moduleWeights.value[name] || 0) / 100
+    if (weight <= 0) continue
+    mods.push({
+      name,
+      weight,
+      params: moduleParams.value[name] || {},
+    })
+  }
+  return {
+    modules: mods,
+    ...signalConfig.value,
+  }
+}
 
 const activeChartTab = ref<'kline' | 'equity'>('kline')
 const equityChartContainer = ref<HTMLElement | null>(null)
@@ -333,9 +588,10 @@ async function doBacktest() {
       alloc: allocPct.value / 100,
       fee: feePct.value / 100,
     }
-    if (form.value.strategy !== 'manual_composite') {
-      delete req.price_strategy
-      delete req.volume_strategy
+    delete req.price_strategy
+    delete req.volume_strategy
+    if (form.value.strategy === 'custom_weighted') {
+      req.strategy_config = buildStrategyConfig()
     }
 
     if (useCustomRange.value && dateRange.value) {
@@ -614,15 +870,14 @@ onMounted(async () => {
     const list = await getStrategies()
     if (list?.length) strategies.value = list
   } catch {}
-  isManualComposite.value = form.value.strategy === 'manual_composite'
+  await loadModules()
+  isManualComposite.value = false
+  isCustomWeighted.value = true
 })
 
 watch(() => form.value.strategy, (next) => {
-  isManualComposite.value = next === 'manual_composite'
-  if (next === 'manual_composite') {
-    if (!form.value.price_strategy) form.value.price_strategy = 'ema_crossover'
-    if (!form.value.volume_strategy) form.value.volume_strategy = 'volume_trend'
-  }
+  isManualComposite.value = false
+  isCustomWeighted.value = next === 'custom_weighted'
 })
 
 watch(activeChartTab, async () => {
@@ -723,5 +978,163 @@ onBeforeUnmount(() => {
 }
 :deep(.el-date-editor .el-range-input) {
   color: #e0e0e0 !important;
+}
+
+/* Custom Weighted Panel */
+.custom-weighted-panel {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #333;
+}
+
+.cw-section {
+  margin-bottom: 12px;
+}
+
+.cw-category-title {
+  color: #f0b90b;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  padding-left: 2px;
+}
+
+.cw-module-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0 4px 8px;
+  flex-wrap: wrap;
+}
+
+.cw-checkbox :deep(.el-checkbox__label) {
+  color: #e0e0e0 !important;
+  font-size: 13px;
+}
+
+.cw-mod-label {
+  min-width: 100px;
+  display: inline-block;
+}
+
+.cw-info-icon {
+  color: #666;
+  font-size: 14px;
+  cursor: help;
+}
+
+.cw-weight-area {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+}
+
+.cw-weight-val {
+  color: #f0b90b;
+  font-size: 12px;
+  min-width: 32px;
+  text-align: right;
+}
+
+.cw-params {
+  display: flex;
+  gap: 10px;
+  margin-left: 12px;
+}
+
+.cw-param-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.cw-param-label {
+  color: #888;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* Signal groups layout */
+.cw-preset-btns {
+  display: flex;
+  gap: 6px;
+}
+
+.cw-signal-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.cw-signal-group {
+  background: #252526;
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.cw-group-header {
+  color: #b0b0b0;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #333;
+}
+
+.cw-group-params {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cw-signal-param {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.cw-signal-param-top {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.cw-signal-param-label {
+  color: #e0e0e0;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.cw-signal-row {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding-left: 8px;
+}
+
+.cw-weight-summary {
+  display: flex;
+  align-items: center;
+  padding: 8px 8px 0 8px;
+  margin-top: 4px;
+  border-top: 1px solid #333;
+  color: #b0b0b0;
+  font-size: 13px;
+}
+
+:deep(.cw-module-row .el-slider__runway) {
+  background-color: #333;
+}
+:deep(.cw-module-row .el-slider__bar) {
+  background-color: #f0b90b;
+}
+:deep(.cw-module-row .el-slider__button) {
+  border-color: #f0b90b;
+  width: 12px;
+  height: 12px;
 }
 </style>

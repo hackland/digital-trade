@@ -12,12 +12,13 @@ import (
 // A golden cross (fast EMA crosses above slow EMA) triggers a BUY.
 // A death cross (fast EMA crosses below slow EMA) triggers a SELL.
 type EMACrossStrategy struct {
-	fastPeriod    int
-	slowPeriod    int
-	rsiFilter     bool
-	rsiPeriod     int
-	rsiOverbought float64
-	rsiOversold   float64
+	fastPeriod     int
+	slowPeriod     int
+	rsiFilter      bool
+	rsiPeriod      int
+	rsiOverbought  float64
+	rsiOversold    float64
+	emaDeadZonePct float64 // dead zone buffer to prevent whipsaw (e.g., 0.002 = 0.2%)
 
 	prevFastEMA float64
 	prevSlowEMA float64
@@ -26,12 +27,13 @@ type EMACrossStrategy struct {
 
 func NewEMACrossStrategy() *EMACrossStrategy {
 	return &EMACrossStrategy{
-		fastPeriod:    12,
-		slowPeriod:    26,
-		rsiFilter:     true,
-		rsiPeriod:     14,
-		rsiOverbought: 70,
-		rsiOversold:   30,
+		fastPeriod:     12,
+		slowPeriod:     26,
+		rsiFilter:      true,
+		rsiPeriod:      14,
+		rsiOverbought:  70,
+		rsiOversold:    30,
+		emaDeadZonePct: 0.002, // 0.2% dead zone
 	}
 }
 
@@ -57,6 +59,9 @@ func (s *EMACrossStrategy) Init(cfg map[string]interface{}) error {
 	}
 	if v, ok := cfg["rsi_oversold"]; ok {
 		s.rsiOversold = toFloat(v)
+	}
+	if v, ok := cfg["ema_dead_zone_pct"]; ok {
+		s.emaDeadZonePct = toFloat(v)
 	}
 	return nil
 }
@@ -100,13 +105,21 @@ func (s *EMACrossStrategy) Evaluate(ctx context.Context, snap *strategy.MarketSn
 		return sig, nil
 	}
 
+	// Dead zone: require EMA separation > threshold to confirm crossover.
+	// Prevents rapid flip-flopping when price oscillates near the EMA.
+	deadZone := s.emaDeadZonePct * slowEMA
+	prevBullish := s.prevFastEMA > s.prevSlowEMA+deadZone
+	prevBearish := s.prevFastEMA < s.prevSlowEMA-deadZone
+	nowBullish := fastEMA > slowEMA+deadZone
+	nowBearish := fastEMA < slowEMA-deadZone
+
 	// RSI filter
 	if s.rsiFilter {
 		rsi := snap.Indicators.RSI[s.rsiPeriod]
 		sig.Indicators["rsi"] = rsi
 
-		// Golden cross: fast crosses above slow
-		if s.prevFastEMA <= s.prevSlowEMA && fastEMA > slowEMA {
+		// Golden cross: fast crosses above slow (outside dead zone)
+		if !prevBullish && nowBullish {
 			if rsi < s.rsiOverbought { // Don't buy when overbought
 				sig.Action = strategy.Buy
 				sig.Strength = clamp((fastEMA-slowEMA)/slowEMA*100, 0, 1)
@@ -117,8 +130,8 @@ func (s *EMACrossStrategy) Evaluate(ctx context.Context, snap *strategy.MarketSn
 			}
 		}
 
-		// Death cross: fast crosses below slow
-		if s.prevFastEMA >= s.prevSlowEMA && fastEMA < slowEMA {
+		// Death cross: fast crosses below slow (outside dead zone)
+		if !prevBearish && nowBearish {
 			if rsi > s.rsiOversold { // Don't sell when oversold
 				sig.Action = strategy.Sell
 				sig.Strength = clamp((slowEMA-fastEMA)/slowEMA*100, 0, 1)
@@ -130,7 +143,7 @@ func (s *EMACrossStrategy) Evaluate(ctx context.Context, snap *strategy.MarketSn
 		}
 	} else {
 		// Without RSI filter
-		if s.prevFastEMA <= s.prevSlowEMA && fastEMA > slowEMA {
+		if !prevBullish && nowBullish {
 			sig.Action = strategy.Buy
 			sig.Strength = clamp((fastEMA-slowEMA)/slowEMA*100, 0, 1)
 			sig.Reason = fmt.Sprintf(
@@ -138,7 +151,7 @@ func (s *EMACrossStrategy) Evaluate(ctx context.Context, snap *strategy.MarketSn
 				s.fastPeriod, fastEMA, s.slowPeriod, slowEMA,
 			)
 		}
-		if s.prevFastEMA >= s.prevSlowEMA && fastEMA < slowEMA {
+		if !prevBearish && nowBearish {
 			sig.Action = strategy.Sell
 			sig.Strength = clamp((slowEMA-fastEMA)/slowEMA*100, 0, 1)
 			sig.Reason = fmt.Sprintf(

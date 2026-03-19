@@ -16,6 +16,13 @@ type Config struct {
 	Risk      RiskConfig      `mapstructure:"risk"`
 	Dashboard DashboardConfig `mapstructure:"dashboard"`
 	Snapshot  SnapshotConfig  `mapstructure:"snapshot"`
+	Telegram  TelegramConfig  `mapstructure:"telegram"`
+}
+
+type TelegramConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	Token   string `mapstructure:"token"`
+	ChatID  string `mapstructure:"chat_id"`
 }
 
 type AppConfig struct {
@@ -52,6 +59,8 @@ type RiskConfig struct {
 	MaxPositionPctAcct   float64       `mapstructure:"max_position_pct_account"`
 	DefaultStopLossPct   float64       `mapstructure:"default_stop_loss_pct"`
 	DefaultTakeProfitPct float64       `mapstructure:"default_take_profit_pct"`
+	ATRStopMultiplier    float64       `mapstructure:"atr_stop_multiplier"`    // SL = entry - ATR * multiplier (0 = disabled)
+	ATRTPMultiplier      float64       `mapstructure:"atr_tp_multiplier"`      // TP = entry + ATR * multiplier (0 = disabled)
 	TrailingStopEnabled  bool          `mapstructure:"trailing_stop_enabled"`
 	TrailingStopPct      float64       `mapstructure:"trailing_stop_pct"`
 	MaxDailyLossUSDT     float64       `mapstructure:"max_daily_loss_usdt"`
@@ -95,6 +104,8 @@ func Load(configPath string) (*Config, error) {
 	v.BindEnv("exchange.api_key", "BINANCE_API_KEY")
 	v.BindEnv("exchange.secret_key", "BINANCE_SECRET_KEY")
 	v.BindEnv("database.dsn", "DB_DSN")
+	v.BindEnv("telegram.token", "TELEGRAM_BOT_TOKEN")
+	v.BindEnv("telegram.chat_id", "TELEGRAM_CHAT_ID")
 
 	// Defaults
 	v.SetDefault("app.name", "btc-trader")

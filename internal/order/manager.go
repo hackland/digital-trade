@@ -35,6 +35,7 @@ type Manager struct {
 	slOrders      map[string]int64   // symbol → SL order ID
 	tpOrders      map[string]int64   // symbol → TP order ID
 	trailingHighs map[string]float64 // symbol → highest price since entry (for trailing stop)
+	lastATR       map[string]float64 // symbol → ATR at signal time (for dynamic SL/TP)
 }
 
 // NewManager creates a new order manager.
@@ -57,6 +58,7 @@ func NewManager(
 		slOrders:      make(map[string]int64),
 		tpOrders:      make(map[string]int64),
 		trailingHighs: make(map[string]float64),
+		lastATR:       make(map[string]float64),
 	}
 }
 
@@ -75,6 +77,15 @@ func (m *Manager) ProcessSignal(ctx context.Context, sig *strategy.Signal) error
 	req, err := m.buildOrderRequest(ctx, sig)
 	if err != nil {
 		return fmt.Errorf("build order: %w", err)
+	}
+
+	// Cache ATR from signal for dynamic SL/TP placement
+	if sig.Action == strategy.Buy && sig.Indicators != nil {
+		if atr, ok := sig.Indicators["atr"]; ok && atr > 0 {
+			m.mu.Lock()
+			m.lastATR[sig.Symbol] = atr
+			m.mu.Unlock()
+		}
 	}
 
 	// Pre-trade risk check
@@ -394,6 +405,7 @@ func (m *Manager) onOrderFilled(ctx context.Context, order *exchange.Order, stra
 }
 
 // placeSLTPOrders places stop-loss and take-profit orders after a buy fill.
+// Uses ATR-based dynamic levels when available, falls back to fixed percentage.
 func (m *Manager) placeSLTPOrders(ctx context.Context, buyOrder *exchange.Order) {
 	entryPrice := buyOrder.AvgPrice
 	if entryPrice == 0 {
@@ -406,10 +418,40 @@ func (m *Manager) placeSLTPOrders(ctx context.Context, buyOrder *exchange.Order)
 		return
 	}
 
-	// Place stop-loss if configured
-	if m.riskCfg.DefaultStopLossPct > 0 {
-		slPrice := entryPrice * (1 - m.riskCfg.DefaultStopLossPct)
-		slPrice = roundPrice(slPrice) // round to avoid precision issues
+	// Try ATR-based dynamic SL/TP first, fall back to fixed percentage
+	m.mu.RLock()
+	atr := m.lastATR[symbol]
+	m.mu.RUnlock()
+
+	var slPrice, tpPrice float64
+	var slMethod, tpMethod string
+
+	// Stop-loss calculation
+	if atr > 0 && m.riskCfg.ATRStopMultiplier > 0 {
+		// ATR-based: SL = entry - ATR * multiplier
+		slPrice = entryPrice - atr*m.riskCfg.ATRStopMultiplier
+		slMethod = fmt.Sprintf("ATR(%.0f)*%.1f", atr, m.riskCfg.ATRStopMultiplier)
+	} else if m.riskCfg.DefaultStopLossPct > 0 {
+		// Fixed percentage fallback
+		slPrice = entryPrice * (1 - m.riskCfg.DefaultStopLossPct)
+		slMethod = fmt.Sprintf("fixed %.1f%%", m.riskCfg.DefaultStopLossPct*100)
+	}
+
+	// Take-profit calculation
+	if atr > 0 && m.riskCfg.ATRTPMultiplier > 0 {
+		// ATR-based: TP = entry + ATR * multiplier
+		tpPrice = entryPrice + atr*m.riskCfg.ATRTPMultiplier
+		tpMethod = fmt.Sprintf("ATR(%.0f)*%.1f", atr, m.riskCfg.ATRTPMultiplier)
+	} else if m.riskCfg.DefaultTakeProfitPct > 0 {
+		// Fixed percentage fallback
+		tpPrice = entryPrice * (1 + m.riskCfg.DefaultTakeProfitPct)
+		tpMethod = fmt.Sprintf("fixed %.1f%%", m.riskCfg.DefaultTakeProfitPct*100)
+	}
+
+	// Place stop-loss
+	if slPrice > 0 {
+		slPrice = roundPrice(slPrice)
+		slPct := (entryPrice - slPrice) / entryPrice * 100
 
 		slOrder, err := m.exchange.PlaceOrder(ctx, exchange.OrderRequest{
 			Symbol:    symbol,
@@ -432,17 +474,18 @@ func (m *Manager) placeSLTPOrders(ctx context.Context, buyOrder *exchange.Order)
 
 			m.logger.Info("stop-loss placed",
 				zap.String("symbol", symbol),
+				zap.String("method", slMethod),
 				zap.Float64("entry", entryPrice),
 				zap.Float64("sl_price", slPrice),
-				zap.Float64("sl_pct", m.riskCfg.DefaultStopLossPct*100),
+				zap.Float64("sl_pct", slPct),
 			)
 		}
 	}
 
-	// Place take-profit if configured
-	if m.riskCfg.DefaultTakeProfitPct > 0 {
-		tpPrice := entryPrice * (1 + m.riskCfg.DefaultTakeProfitPct)
+	// Place take-profit
+	if tpPrice > 0 {
 		tpPrice = roundPrice(tpPrice)
+		tpPct := (tpPrice - entryPrice) / entryPrice * 100
 
 		tpOrder, err := m.exchange.PlaceOrder(ctx, exchange.OrderRequest{
 			Symbol:    symbol,
@@ -465,9 +508,10 @@ func (m *Manager) placeSLTPOrders(ctx context.Context, buyOrder *exchange.Order)
 
 			m.logger.Info("take-profit placed",
 				zap.String("symbol", symbol),
+				zap.String("method", tpMethod),
 				zap.Float64("entry", entryPrice),
 				zap.Float64("tp_price", tpPrice),
-				zap.Float64("tp_pct", m.riskCfg.DefaultTakeProfitPct*100),
+				zap.Float64("tp_pct", tpPct),
 			)
 		}
 	}
@@ -484,6 +528,11 @@ func (m *Manager) placeSLTPOrders(ctx context.Context, buyOrder *exchange.Order)
 			zap.Float64("trail_pct", m.riskCfg.TrailingStopPct*100),
 		)
 	}
+
+	// Clean up cached ATR
+	m.mu.Lock()
+	delete(m.lastATR, symbol)
+	m.mu.Unlock()
 }
 
 // checkTrailingStop evaluates the trailing stop condition on each price tick.

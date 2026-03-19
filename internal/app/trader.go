@@ -12,6 +12,7 @@ import (
 	"github.com/jayce/btc-trader/internal/exchange"
 	"github.com/jayce/btc-trader/internal/exchange/binance"
 	"github.com/jayce/btc-trader/internal/market"
+	"github.com/jayce/btc-trader/internal/notify"
 	"github.com/jayce/btc-trader/internal/order"
 	"github.com/jayce/btc-trader/internal/position"
 	"github.com/jayce/btc-trader/internal/risk"
@@ -190,6 +191,19 @@ func (t *Trader) Run(ctx context.Context) error {
 		})
 	}
 
+	// Telegram notifications
+	if t.cfg.Telegram.Enabled {
+		tgCfg := notify.TelegramConfig{
+			Enabled: t.cfg.Telegram.Enabled,
+			Token:   t.cfg.Telegram.Token,
+			ChatID:  t.cfg.Telegram.ChatID,
+		}
+		tgNotifier := notify.NewTelegramNotifier(tgCfg, t.bus, t.logger.Named("telegram"))
+		g.Go(func() error {
+			return tgNotifier.Run(gCtx)
+		})
+	}
+
 	return g.Wait()
 }
 
@@ -259,15 +273,31 @@ func (t *Trader) runKlineIngestion(ctx context.Context, symbol, interval string)
 func (t *Trader) runStrategyLoop(ctx context.Context) error {
 	klineCh := t.bus.Subscribe(eventbus.EventKlineUpdate, 1000)
 
-	// Maintain kline windows per symbol
+	// Maintain kline windows per symbol+interval
 	windows := make(map[string][]exchange.Kline)
 	historySize := t.strat.RequiredHistory()
 
 	// Determine the strategy's target interval from config
-	targetInterval := "5m"
+	targetInterval := "1h"
 	if v, ok := t.cfg.Strategy.Config["interval"]; ok {
 		if s, ok := v.(string); ok {
 			targetInterval = s
+		}
+	}
+
+	// Multi-timeframe: detect if strategy supports HTF
+	var htfInterval string
+	var htfHistSize int
+	var htfIndReqs []strategy.IndicatorRequirement
+	if cw, ok := t.strat.(*trend.CustomWeightedStrategy); ok {
+		htfInterval = cw.HTFInterval()
+		htfHistSize = cw.HTFHistoryRequired()
+		htfIndReqs = cw.HTFIndicatorRequirements()
+		if htfInterval != "" {
+			t.logger.Info("multi-timeframe enabled",
+				zap.String("htf_interval", htfInterval),
+				zap.Int("htf_history", htfHistSize),
+			)
 		}
 	}
 
@@ -285,12 +315,23 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 				continue
 			}
 
+			// Accumulate HTF klines (e.g., 4h) into their own window
+			if htfInterval != "" && ke.Interval == htfInterval && ke.Kline.IsFinal {
+				htfKey := ke.Symbol + ":" + ke.Interval
+				w := windows[htfKey]
+				w = append(w, ke.Kline)
+				if len(w) > htfHistSize*2 {
+					w = w[len(w)-htfHistSize*2:]
+				}
+				windows[htfKey] = w
+			}
+
 			// Only evaluate on the target interval and final klines
 			if ke.Interval != targetInterval || !ke.Kline.IsFinal {
 				continue
 			}
 
-			// Update window
+			// Update primary window
 			key := ke.Symbol + ":" + ke.Interval
 			window := windows[key]
 			window = append(window, ke.Kline)
@@ -303,7 +344,7 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 				continue
 			}
 
-			// Compute indicators
+			// Compute indicators on primary timeframe
 			indicators := t.indComp.ComputeAll(window, t.strat.RequiredIndicators())
 
 			// Build snapshot
@@ -319,6 +360,17 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 					Side:          pos.Side,
 				},
 				Timestamp: ke.Kline.CloseTime,
+			}
+
+			// Attach HTF data if available
+			if htfInterval != "" {
+				htfKey := ke.Symbol + ":" + htfInterval
+				htfWindow := windows[htfKey]
+				if len(htfWindow) >= htfHistSize {
+					snapshot.HTFKlines = htfWindow
+					snapshot.HTFInterval = htfInterval
+					snapshot.HTFIndicators = t.indComp.ComputeAll(htfWindow, htfIndReqs)
+				}
 			}
 
 			// Evaluate strategy
@@ -505,11 +557,6 @@ func (t *Trader) backfillKlines(ctx context.Context) {
 
 func createStrategy(cfg config.StrategyConfig) (strategy.Strategy, error) {
 	reg := strategy.NewRegistry()
-	reg.Register("ema_crossover", func() strategy.Strategy { return trend.NewEMACrossStrategy() })
-	reg.Register("macd_rsi", func() strategy.Strategy { return trend.NewMACDRSIStrategy() })
-	reg.Register("bb_breakout", func() strategy.Strategy { return trend.NewBBBreakoutStrategy() })
-	reg.Register("vwap_reversion", func() strategy.Strategy { return trend.NewVWAPReversionStrategy() })
-	reg.Register("volume_trend", func() strategy.Strategy { return trend.NewVolumeTrendStrategy() })
-	reg.Register("composite_score", func() strategy.Strategy { return trend.NewCompositeScoreStrategy() })
+	reg.Register("custom_weighted", func() strategy.Strategy { return trend.NewCustomWeightedStrategy() })
 	return reg.Create(cfg.Name, cfg.Config)
 }

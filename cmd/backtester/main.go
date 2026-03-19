@@ -144,5 +144,6 @@ func createStrategy(name string, cfg map[string]interface{}) (strategy.Strategy,
 	reg.Register("vwap_reversion", func() strategy.Strategy { return trend.NewVWAPReversionStrategy() })
 	reg.Register("volume_trend", func() strategy.Strategy { return trend.NewVolumeTrendStrategy() })
 	reg.Register("composite_score", func() strategy.Strategy { return trend.NewCompositeScoreStrategy() })
+	reg.Register("custom_weighted", func() strategy.Strategy { return trend.NewCustomWeightedStrategy() })
 	return reg.Create(name, cfg)
 }

@@ -26,13 +26,15 @@ func (ic *IndicatorComputer) ComputeAll(
 	volumes := extractVolumes(klines)
 
 	set := strategy.IndicatorSet{
-		SMA:       make(map[int]float64),
-		EMA:       make(map[int]float64),
-		RSI:       make(map[int]float64),
-		ATR:       make(map[int]float64),
-		MFI:       make(map[int]float64),
-		CMF:       make(map[int]float64),
-		VolumeSMA: make(map[int]float64),
+		SMA:        make(map[int]float64),
+		EMA:        make(map[int]float64),
+		RSI:        make(map[int]float64),
+		ATR:        make(map[int]float64),
+		MFI:        make(map[int]float64),
+		CMF:        make(map[int]float64),
+		VolumeSMA:  make(map[int]float64),
+		VROC:       make(map[int]float64),
+		ForceIndex: make(map[int]float64),
 	}
 
 	for _, req := range requirements {
@@ -85,6 +87,26 @@ func (ic *IndicatorComputer) ComputeAll(
 		case "VolumeSMA":
 			period := req.Params["period"]
 			set.VolumeSMA[period] = ic.ComputeVolumeSMA(volumes, period)
+		case "KDJ":
+			period := req.Params["period"]
+			kSmooth := req.Params["k_smooth"]
+			dSmooth := req.Params["d_smooth"]
+			if period == 0 {
+				period = 9
+			}
+			if kSmooth == 0 {
+				kSmooth = 3
+			}
+			if dSmooth == 0 {
+				dSmooth = 3
+			}
+			set.KDJ = ic.ComputeKDJ(highs, lows, closes, period, kSmooth, dSmooth)
+		case "VROC":
+			period := req.Params["period"]
+			set.VROC[period] = ic.ComputeVROC(volumes, period)
+		case "ForceIndex":
+			period := req.Params["period"]
+			set.ForceIndex[period] = ic.ComputeForceIndex(closes, volumes, period)
 		}
 	}
 
@@ -418,6 +440,91 @@ func (ic *IndicatorComputer) ComputeVolumeSMA(volumes []float64, period int) flo
 		sum += v
 	}
 	return sum / float64(period)
+}
+
+// --- KDJ (Stochastic) ---
+
+// ComputeKDJ calculates the KDJ stochastic indicator.
+// RSV = (Close - LowestLow) / (HighestHigh - LowestLow) * 100
+// K = smoothed RSV, D = smoothed K, J = 3K - 2D
+func (ic *IndicatorComputer) ComputeKDJ(highs, lows, closes []float64, period, kSmooth, dSmooth int) strategy.KDJValue {
+	n := len(closes)
+	if n < period {
+		return strategy.KDJValue{K: 50, D: 50, J: 50}
+	}
+
+	k := 50.0
+	d := 50.0
+
+	for i := period - 1; i < n; i++ {
+		highestHigh := highs[i]
+		lowestLow := lows[i]
+		for j := i - period + 1; j <= i; j++ {
+			if highs[j] > highestHigh {
+				highestHigh = highs[j]
+			}
+			if lows[j] < lowestLow {
+				lowestLow = lows[j]
+			}
+		}
+
+		rsv := 50.0
+		hl := highestHigh - lowestLow
+		if hl > 0 {
+			rsv = (closes[i] - lowestLow) / hl * 100
+		}
+
+		// SMA smoothing: K = (prevK * (kSmooth-1) + RSV) / kSmooth
+		k = (k*float64(kSmooth-1) + rsv) / float64(kSmooth)
+		d = (d*float64(dSmooth-1) + k) / float64(dSmooth)
+	}
+
+	j := 3*k - 2*d
+	return strategy.KDJValue{K: k, D: d, J: j}
+}
+
+// --- VROC (Volume Rate of Change) ---
+
+// ComputeVROC calculates the volume rate of change as a percentage.
+// VROC = (CurrentVolume - VolumeNPeriodsAgo) / VolumeNPeriodsAgo * 100
+func (ic *IndicatorComputer) ComputeVROC(volumes []float64, period int) float64 {
+	n := len(volumes)
+	if n <= period || period <= 0 {
+		return 0
+	}
+	prevVol := volumes[n-1-period]
+	if prevVol == 0 {
+		return 0
+	}
+	return (volumes[n-1] - prevVol) / prevVol * 100
+}
+
+// --- Force Index ---
+
+// ComputeForceIndex calculates the EMA-smoothed Force Index.
+// Raw Force Index = (Close - PrevClose) * Volume
+// Result is EMA-smoothed over the given period.
+func (ic *IndicatorComputer) ComputeForceIndex(closes, volumes []float64, period int) float64 {
+	n := len(closes)
+	if n < 2 || len(volumes) < 2 {
+		return 0
+	}
+
+	// Compute raw force index series
+	raw := make([]float64, n-1)
+	for i := 1; i < n; i++ {
+		raw[i-1] = (closes[i] - closes[i-1]) * volumes[i]
+	}
+
+	if period <= 1 || len(raw) < period {
+		if len(raw) > 0 {
+			return raw[len(raw)-1]
+		}
+		return 0
+	}
+
+	// EMA smooth the raw force index
+	return ic.ComputeEMA(raw, period)
 }
 
 // --- Helpers ---

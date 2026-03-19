@@ -1,6 +1,9 @@
 package handler
 
-import "github.com/gin-gonic/gin"
+import (
+	"github.com/gin-gonic/gin"
+	"github.com/jayce/btc-trader/internal/strategy/modules"
+)
 
 type strategyResponse struct {
 	Name      string `json:"name"`
@@ -33,5 +36,86 @@ func (h *Handler) GetStrategyStatus(c *gin.Context) {
 		"required_history":    strat.RequiredHistory(),
 		"required_indicators": strat.RequiredIndicators(),
 		"config":              cfg.Config,
+	})
+}
+
+// GetIndicatorModules returns all available scoring modules with metadata.
+// Frontend uses this to render the indicator selection + weight configuration UI.
+func (h *Handler) GetIndicatorModules(c *gin.Context) {
+	metas := modules.AllMeta()
+
+	// Group by category for frontend convenience
+	grouped := make(map[string][]modules.ModuleMeta)
+	for _, m := range metas {
+		grouped[m.Category] = append(grouped[m.Category], m)
+	}
+
+	ok(c, gin.H{
+		"modules": metas,
+		"grouped": grouped,
+		"signal_params": []modules.ParamSchema{
+			// 买卖信号
+			{Key: "buy_threshold", Label: "买入阈值", Type: "float", Default: 0.20, Min: 0.05, Max: 0.8, Step: 0.05, Group: "signal", Desc: "综合评分超过此值才触发买入，越高越严格"},
+			{Key: "sell_threshold", Label: "卖出阈值", Type: "float", Default: -0.30, Min: -1.0, Max: -0.1, Step: 0.05, Group: "signal", Desc: "综合评分低于此值触发卖出，越低越宽松"},
+			{Key: "confirm_bars", Label: "确认K线数", Type: "int", Default: 1, Min: 1, Max: 5, Step: 1, Group: "signal", Desc: "连续N根K线评分达标才买入，防止假信号"},
+			// 持仓控制
+			{Key: "cooldown_bars", Label: "冷却期", Type: "int", Default: 12, Min: 0, Max: 48, Step: 1, Group: "position", Desc: "卖出后等待N根K线才允许再次买入"},
+			{Key: "min_hold_bars", Label: "最短持仓", Type: "int", Default: 6, Min: 0, Max: 30, Step: 1, Group: "position", Desc: "买入后至少持有N根K线，避免频繁交易"},
+			// 止损
+			{Key: "atr_stop_mult", Label: "ATR止损倍数", Type: "float", Default: 3.0, Min: 1.0, Max: 6.0, Step: 0.1, Group: "stoploss", Desc: "追踪止损距离 = ATR × 倍数，越大越宽松"},
+			// 趋势过滤
+			{Key: "trend_filter", Label: "EMA趋势过滤", Type: "bool", Default: false, Min: 0, Max: 1, Step: 1, Group: "trend", Desc: "开启后只在价格高于EMA均线时买入，过滤下跌趋势"},
+			{Key: "trend_period", Label: "EMA周期", Type: "int", Default: 50, Min: 20, Max: 200, Step: 5, Group: "trend", Desc: "趋势判断用的均线周期，50表示看50根K线趋势"},
+			{Key: "htf_enabled", Label: "大周期过滤", Type: "bool", Default: true, Min: 0, Max: 1, Step: 1, Group: "trend", Desc: "开启后用更大时间周期确认趋势方向"},
+			{Key: "htf_interval", Label: "大周期", Type: "string", Default: "1d", Group: "trend", Desc: "用于趋势确认的大时间框架"},
+			{Key: "htf_period", Label: "大周期EMA", Type: "int", Default: 10, Min: 5, Max: 100, Step: 5, Group: "trend", Desc: "大周期上的EMA均线周期"},
+		},
+		"signal_presets": map[string]map[string]any{
+			"conservative": {
+				"label":         "保守",
+				"desc":          "低频交易，高确认，严格过滤",
+				"buy_threshold":  0.30,
+				"sell_threshold": -0.30,
+				"confirm_bars":   2,
+				"cooldown_bars":  24,
+				"min_hold_bars":  12,
+				"atr_stop_mult":  3.5,
+				"trend_filter":   false,
+				"trend_period":   50,
+				"htf_enabled":    true,
+				"htf_interval":   "1d",
+				"htf_period":     10,
+			},
+			"standard": {
+				"label":         "标准",
+				"desc":          "推荐配置: EMA+MACD+MFI, 日线过滤",
+				"buy_threshold":  0.20,
+				"sell_threshold": -0.30,
+				"confirm_bars":   1,
+				"cooldown_bars":  12,
+				"min_hold_bars":  6,
+				"atr_stop_mult":  3.0,
+				"trend_filter":   false,
+				"trend_period":   50,
+				"htf_enabled":    true,
+				"htf_interval":   "1d",
+				"htf_period":     10,
+			},
+			"aggressive": {
+				"label":         "激进",
+				"desc":          "低阈值、快进快出，交易频率高",
+				"buy_threshold":  0.10,
+				"sell_threshold": -0.15,
+				"confirm_bars":   1,
+				"cooldown_bars":  2,
+				"min_hold_bars":  3,
+				"atr_stop_mult":  2.0,
+				"trend_filter":   false,
+				"trend_period":   30,
+				"htf_enabled":    true,
+				"htf_interval":   "1d",
+				"htf_period":     10,
+			},
+		},
 	})
 }
