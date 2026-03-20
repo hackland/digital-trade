@@ -58,62 +58,62 @@ type Store interface {
 // --- Record types ---
 
 type TradeRecord struct {
-	ID           int64
-	ExchangeID   int64
-	OrderID      int64
-	Symbol       string
-	Side         string
-	Price        float64
-	Quantity     float64
-	Fee          float64
-	FeeAsset     string
-	StrategyName string
-	RealizedPnL  float64
-	Timestamp    time.Time
-	CreatedAt    time.Time
+	ID           int64     `json:"id"`
+	ExchangeID   int64     `json:"exchange_id"`
+	OrderID      int64     `json:"order_id"`
+	Symbol       string    `json:"symbol"`
+	Side         string    `json:"side"`
+	Price        float64   `json:"price"`
+	Quantity     float64   `json:"quantity"`
+	Fee          float64   `json:"fee"`
+	FeeAsset     string    `json:"fee_asset"`
+	StrategyName string    `json:"strategy_name"`
+	RealizedPnL  float64   `json:"realized_pnl"`
+	Timestamp    time.Time `json:"timestamp"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type OrderRecord struct {
-	ID            int64
-	ExchangeID    int64
-	ClientOrderID string
-	Symbol        string
-	Side          string
-	Type          string
-	Status        string
-	Price         float64
-	Quantity      float64
-	FilledQty     float64
-	AvgPrice      float64
-	StopPrice     float64
-	StrategyName  string
-	SignalReason  string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID            int64     `json:"id"`
+	ExchangeID    int64     `json:"exchange_id"`
+	ClientOrderID string    `json:"client_order_id"`
+	Symbol        string    `json:"symbol"`
+	Side          string    `json:"side"`
+	Type          string    `json:"type"`
+	Status        string    `json:"status"`
+	Price         float64   `json:"price"`
+	Quantity      float64   `json:"quantity"`
+	FilledQty     float64   `json:"filled_qty"`
+	AvgPrice      float64   `json:"avg_price"`
+	StopPrice     float64   `json:"stop_price"`
+	StrategyName  string    `json:"strategy_name"`
+	SignalReason  string    `json:"signal_reason"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type AccountSnapshot struct {
-	Timestamp     time.Time
-	TotalEquity   float64
-	FreeCash      float64
-	PositionValue float64
-	UnrealizedPnL float64
-	RealizedPnL   float64
-	DailyPnL      float64
-	DrawdownPct   float64
-	Positions     map[string]float64 // symbol -> quantity
+	Timestamp     time.Time          `json:"timestamp"`
+	TotalEquity   float64            `json:"total_equity"`
+	FreeCash      float64            `json:"free_cash"`
+	PositionValue float64            `json:"position_value"`
+	UnrealizedPnL float64            `json:"unrealized_pnl"`
+	RealizedPnL   float64            `json:"realized_pnl"`
+	DailyPnL      float64            `json:"daily_pnl"`
+	DrawdownPct   float64            `json:"drawdown_pct"`
+	Positions     map[string]float64 `json:"positions"` // symbol -> quantity
 }
 
 type SignalRecord struct {
-	ID           int64
-	Timestamp    time.Time
-	Symbol       string
-	StrategyName string
-	Action       string
-	Strength     float64
-	Reason       string
-	Indicators   map[string]float64
-	WasExecuted  bool
+	ID           int64              `json:"id"`
+	Timestamp    time.Time          `json:"timestamp"`
+	Symbol       string             `json:"symbol"`
+	StrategyName string             `json:"strategy_name"`
+	Action       string             `json:"action"`
+	Strength     float64            `json:"strength"`
+	Reason       string             `json:"reason"`
+	Indicators   map[string]float64 `json:"indicators"`
+	WasExecuted  bool               `json:"was_executed"`
 }
 
 // --- Filters ---

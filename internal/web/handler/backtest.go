@@ -54,16 +54,23 @@ func (h *Handler) RunBacktest(c *gin.Context) {
 	// Parse time range
 	var start, end time.Time
 	var err error
-	end = time.Now().UTC()
+	// For consistency with frontend date pickers, we treat date ranges as whole days:
+	// start = 00:00:00 UTC of the start day
+	// end   = 23:59:59 UTC of the end day (DB query uses time >= start AND time <= end)
+	nowUTC := time.Now().UTC()
+	endDay := time.Date(nowUTC.Year(), nowUTC.Month(), nowUTC.Day(), 0, 0, 0, 0, time.UTC)
+	end = endDay.Add(24*time.Hour - time.Second) // end of current day
 
 	if req.End != "" {
-		end, err = time.Parse("2006-01-02", req.End)
+		var parsedEnd time.Time
+		parsedEnd, err = time.Parse("2006-01-02", req.End)
 		if err != nil {
 			errResp(c, http.StatusBadRequest, "invalid end date: "+err.Error())
 			return
 		}
 		// Set to end of day
-		end = end.Add(24*time.Hour - time.Second)
+		endDay = parsedEnd
+		end = parsedEnd.Add(24*time.Hour - time.Second)
 	}
 
 	if req.Start != "" {
@@ -73,7 +80,9 @@ func (h *Handler) RunBacktest(c *gin.Context) {
 			return
 		}
 	} else {
-		start = end.Add(-time.Duration(req.Days) * 24 * time.Hour)
+		// Days preset: interpret `req.Days` as an inclusive day count, matching the UI date picker.
+		// If end day is D0, start day becomes D0-(req.Days-1).
+		start = endDay.Add(-time.Duration(req.Days-1) * 24 * time.Hour)
 	}
 
 	// Create strategy: use frontend config if provided, else global config

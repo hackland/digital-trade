@@ -86,18 +86,26 @@ func (n *TelegramNotifier) handleSignal(ctx context.Context, evt eventbus.Event)
 		return
 	}
 
-	var emoji string
+	var emoji, label string
 	switch sig.Action {
 	case "BUY":
 		emoji = "📈"
+		label = "做多买入"
 	case "SELL":
 		emoji = "📉"
+		label = "做多卖出"
+	case "SHORT":
+		emoji = "🔻"
+		label = "做空信号 (仅提醒)"
+	case "COVER":
+		emoji = "🔺"
+		label = "平空信号 (仅提醒)"
 	default:
 		return // Don't notify on HOLD
 	}
 
-	msg := fmt.Sprintf("%s *%s 信号*\n币对: `%s`\n强度: `%.2f`\n策略: %s\n原因: %s",
-		emoji, sig.Action, sig.Symbol, sig.Strength, sig.Strategy, sig.Reason)
+	msg := fmt.Sprintf("%s *%s*\n币对: `%s`\n强度: `%.2f`\n策略: %s\n原因: %s",
+		emoji, label, sig.Symbol, sig.Strength, sig.Strategy, sig.Reason)
 	n.send(ctx, msg)
 }
 

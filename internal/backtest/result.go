@@ -30,6 +30,10 @@ type Result struct {
 
 	// Equity curve (time → equity value)
 	EquityCurve []EquityPoint `json:"equity_curve"`
+
+	// Short strategy results (independent of long)
+	ShortTrades  []TradeRecord `json:"short_trades"`
+	ShortMetrics Metrics       `json:"short_metrics"`
 }
 
 // TradeRecord represents a single trade in the backtest.
@@ -282,6 +286,77 @@ func (r *Result) PrintSummary() string {
 	sb.WriteString(fmt.Sprintf("  Sortino:    %.2f\n", r.Metrics.SortinoRatio))
 	sb.WriteString("═══════════════════════════════════════════\n")
 	return sb.String()
+}
+
+// ComputeShortMetrics calculates performance metrics from short trade records.
+// Short trades are virtual (not on simulated exchange), so metrics are computed
+// directly from the TradeRecord list rather than exchange.Trade objects.
+func ComputeShortMetrics(trades []TradeRecord, initialCash float64) Metrics {
+	m := Metrics{FinalEquity: initialCash}
+
+	// Pair SHORT→COVER trades into round trips
+	var roundTrips []float64
+	var entryPrice, entryQty, entryFee float64
+
+	for _, t := range trades {
+		switch t.Side {
+		case "SHORT":
+			entryPrice = t.Price
+			entryQty = t.Quantity
+			entryFee = t.Fee
+		case "COVER":
+			if entryQty > 0 {
+				// Short PnL = (entry - exit) * qty - fees
+				grossPnL := (entryPrice - t.Price) * entryQty
+				netPnL := grossPnL - entryFee - t.Fee
+				roundTrips = append(roundTrips, netPnL)
+				m.TotalFees += entryFee + t.Fee
+				entryPrice = 0
+				entryQty = 0
+				entryFee = 0
+			}
+		}
+	}
+
+	m.TotalTrades = len(roundTrips)
+
+	var totalWins, totalLosses float64
+	for _, pnl := range roundTrips {
+		if pnl > 0 {
+			m.WinTrades++
+			totalWins += pnl
+			if pnl > m.LargestWin {
+				m.LargestWin = pnl
+			}
+		} else if pnl < 0 {
+			m.LossTrades++
+			totalLosses += math.Abs(pnl)
+			if pnl < m.LargestLoss {
+				m.LargestLoss = pnl
+			}
+		}
+	}
+
+	if m.TotalTrades > 0 {
+		m.WinRate = float64(m.WinTrades) / float64(m.TotalTrades)
+	}
+	if m.WinTrades > 0 {
+		m.AvgWin = totalWins / float64(m.WinTrades)
+	}
+	if m.LossTrades > 0 {
+		m.AvgLoss = totalLosses / float64(m.LossTrades)
+	}
+	if totalLosses > 0 {
+		m.ProfitFactor = totalWins / totalLosses
+	}
+
+	m.TotalReturn = totalWins - totalLosses - m.TotalFees
+	if initialCash > 0 {
+		m.TotalReturnPct = m.TotalReturn / initialCash * 100
+	}
+	m.FinalEquity = initialCash + m.TotalReturn
+
+	return m
 }
 
 // --- math helpers ---

@@ -142,6 +142,11 @@ func (t *Trader) Run(ctx context.Context) error {
 		t.risk.SetEquity(10000) // 模拟初始资金
 	}
 
+	// Load exchange symbol info (stepSize, minQty, etc.) for order precision
+	if err := t.order.LoadSymbolInfo(ctx); err != nil {
+		t.logger.Warn("failed to load symbol info, orders may fail precision checks", zap.Error(err))
+	}
+
 	// Backfill historical klines from REST API before starting WS streams.
 	// This fills any gaps caused by previous restarts and ensures charts have
 	// enough data to render immediately.
@@ -169,6 +174,13 @@ func (t *Trader) Run(ctx context.Context) error {
 	g.Go(func() error {
 		return t.risk.ContinuousMonitor(gCtx)
 	})
+
+	// Order manager: tracks SL/TP fills, trailing stops, polls order status
+	if t.cfg.App.Mode == "live" {
+		g.Go(func() error {
+			return t.order.Run(gCtx)
+		})
+	}
 
 	// User data stream for order tracking (requires API key)
 	if t.cfg.Exchange.APIKey != "" {
@@ -419,8 +431,21 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 					},
 				})
 
-				// Execute order
-				if t.cfg.App.Mode == "live" {
+				// Execute order or alert
+				if sig.Action.IsShort() {
+					// Short/Cover: alert only — publish event (→ Telegram) but do NOT place orders
+					// Update strategy's virtual short state
+					if shortHandler, ok := t.strat.(interface {
+						OnShortSignalProcessed(strategy.Action, float64)
+					}); ok {
+						price := float64(0)
+						if len(snapshot.Klines) > 0 {
+							price = snapshot.Klines[len(snapshot.Klines)-1].Close
+						}
+						shortHandler.OnShortSignalProcessed(sig.Action, price)
+					}
+					t.store.SaveSignal(ctx, sig, false)
+				} else if t.cfg.App.Mode == "live" {
 					if err := t.order.ProcessSignal(ctx, sig); err != nil {
 						t.logger.Error("process signal", zap.Error(err))
 					}

@@ -226,8 +226,164 @@
         >
           查看实盘策略
         </el-button>
+        <el-button
+          size="small"
+          type="warning"
+          @click="showDiagnostics"
+          :loading="loadingDiag"
+          style="margin-left: 12px; height: 32px; font-weight: 600"
+        >
+          策略诊断
+        </el-button>
       </div>
     </el-card>
+
+    <!-- Diagnostics Dialog -->
+    <el-dialog v-model="diagVisible" title="策略实时诊断" width="680px">
+      <div v-if="diagData" style="font-size: 14px; line-height: 1.8">
+        <!-- Message only (no eval yet) -->
+        <template v-if="diagData.message && !diagData.timestamp">
+          <div style="text-align: center; padding: 20px; color: #909399">
+            {{ diagData.message }}
+          </div>
+        </template>
+        <template v-else>
+          <!-- Status Bar -->
+          <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 16px; padding: 12px; background: #1d1e1f; border-radius: 8px">
+            <el-tag :type="diagData.action === 'HOLD' ? 'info' : diagData.action === 'BUY' ? 'success' : 'danger'" size="large">
+              {{ diagData.action }}
+            </el-tag>
+            <span style="color: #909399">{{ diagData.symbol }}</span>
+            <span style="color: #909399; margin-left: auto; font-size: 12px">{{ formatDiagTime(diagData.timestamp) }}</span>
+          </div>
+
+          <!-- Hold Reason (most important) -->
+          <el-alert
+            v-if="diagData.hold_reason"
+            :title="diagData.hold_reason"
+            type="info"
+            show-icon
+            :closable="false"
+            style="margin-bottom: 16px"
+          />
+          <el-alert
+            v-if="diagData.reason"
+            :title="diagData.reason"
+            type="success"
+            show-icon
+            :closable="false"
+            style="margin-bottom: 16px"
+          />
+
+          <!-- Composite Score -->
+          <div style="margin-bottom: 16px">
+            <div style="font-weight: 600; color: #f0b90b; margin-bottom: 8px">综合评分</div>
+            <div style="display: flex; align-items: center; gap: 12px; padding: 0 12px">
+              <el-progress
+                :percentage="Math.min(Math.abs(diagData.composite_score) * 100, 100)"
+                :color="diagData.composite_score >= 0 ? '#67C23A' : '#F56C6C'"
+                :stroke-width="20"
+                :text-inside="true"
+                :format="() => diagData!.composite_score.toFixed(3)"
+                style="flex: 1"
+              />
+              <span style="color: #909399; font-size: 12px; white-space: nowrap">
+                买入阈值: {{ diagData.buy_threshold }} · 卖出阈值: {{ diagData.sell_threshold }}
+              </span>
+            </div>
+          </div>
+
+          <!-- Module Scores -->
+          <div style="margin-bottom: 16px">
+            <div style="font-weight: 600; color: #f0b90b; margin-bottom: 8px">各模块评分</div>
+            <div v-for="(score, name) in diagData.module_scores" :key="name"
+              style="display: flex; align-items: center; gap: 8px; padding: 4px 12px"
+            >
+              <span style="width: 120px; color: #ccc">{{ name }}</span>
+              <el-progress
+                :percentage="Math.min(Math.abs(score) * 100, 100)"
+                :color="score >= 0 ? '#67C23A' : '#F56C6C'"
+                :stroke-width="14"
+                :text-inside="true"
+                :format="() => score.toFixed(3)"
+                style="flex: 1"
+              />
+              <span style="width: 40px; text-align: right; color: #909399; font-size: 12px">
+                {{ ((diagData.module_weights[name] || 0) * 100).toFixed(0) }}%
+              </span>
+            </div>
+          </div>
+
+          <!-- Filters & State -->
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px">
+            <!-- Left: Filters -->
+            <el-card shadow="never" style="background: #1d1e1f; border-color: #333">
+              <div style="font-weight: 600; color: #f0b90b; margin-bottom: 8px">过滤器状态</div>
+              <div class="diag-row">
+                <span>趋势过滤(EMA)</span>
+                <el-tag v-if="diagData.trend_filter_on" :type="diagData.trend_bullish ? 'success' : 'danger'" size="small">
+                  {{ diagData.trend_bullish ? '看多' : '看空' }} ({{ diagData.trend_ema_dist_pct.toFixed(2) }}%)
+                </el-tag>
+                <el-tag v-else type="info" size="small">关闭</el-tag>
+              </div>
+              <div class="diag-row">
+                <span>大周期过滤(HTF)</span>
+                <el-tag v-if="diagData.htf_enabled" :type="diagData.htf_bullish ? 'success' : 'danger'" size="small">
+                  {{ diagData.htf_bullish ? '看多' : '看空' }} ({{ diagData.htf_ema_dist_pct.toFixed(2) }}%)
+                </el-tag>
+                <el-tag v-else type="info" size="small">关闭</el-tag>
+              </div>
+              <div class="diag-row" v-if="diagData.htf_blocked">
+                <span>HTF拦截</span>
+                <el-tag type="danger" size="small">已拦截买入</el-tag>
+              </div>
+            </el-card>
+            <!-- Right: Position State -->
+            <el-card shadow="never" style="background: #1d1e1f; border-color: #333">
+              <div style="font-weight: 600; color: #f0b90b; margin-bottom: 8px">运行状态</div>
+              <div class="diag-row">
+                <span>持仓</span>
+                <el-tag :type="diagData.has_position ? 'warning' : 'info'" size="small">
+                  {{ diagData.has_position ? '是' : '否' }}
+                </el-tag>
+              </div>
+              <div class="diag-row" v-if="!diagData.has_position">
+                <span>确认进度</span>
+                <span style="color: #ccc">{{ diagData.confirm_count }} / {{ diagData.confirm_bars }}</span>
+              </div>
+              <div class="diag-row" v-if="!diagData.has_position && diagData.cooldown_count > 0">
+                <span>冷却剩余</span>
+                <span style="color: #F56C6C">{{ diagData.cooldown_count }} 根K线</span>
+              </div>
+              <div class="diag-row" v-if="diagData.has_position">
+                <span>入场价</span>
+                <span style="color: #ccc">{{ diagData.entry_price.toFixed(2) }}</span>
+              </div>
+              <div class="diag-row" v-if="diagData.has_position">
+                <span>最高价</span>
+                <span style="color: #ccc">{{ diagData.high_water_mark.toFixed(2) }}</span>
+              </div>
+              <div class="diag-row" v-if="diagData.has_position">
+                <span>止损价</span>
+                <span style="color: #F56C6C">{{ diagData.stop_price.toFixed(2) }}</span>
+              </div>
+              <div class="diag-row" v-if="diagData.has_position">
+                <span>持仓K线</span>
+                <span style="color: #ccc">{{ diagData.bars_since_entry }} / min {{ diagData.min_hold_bars }}</span>
+              </div>
+              <div class="diag-row">
+                <span>当前价</span>
+                <span style="color: #f0b90b">{{ diagData.close_price.toFixed(2) }}</span>
+              </div>
+              <div class="diag-row" v-if="diagData.atr_value > 0">
+                <span>ATR</span>
+                <span style="color: #ccc">{{ diagData.atr_value.toFixed(2) }} × {{ diagData.atr_stop_mult }}</span>
+              </div>
+            </el-card>
+          </div>
+        </template>
+      </div>
+    </el-dialog>
 
     <!-- Live Strategy Dialog -->
     <el-dialog v-model="liveDialogVisible" title="当前实盘策略" width="500px">
@@ -387,6 +543,99 @@
           </el-card>
         </el-col>
       </el-row>
+
+      <!-- Short Strategy Results -->
+      <template v-if="result.short_trades?.length > 0">
+        <el-divider style="border-color: #444; margin: 24px 0 16px">
+          <span style="color: #f0b90b; font-size: 14px; font-weight: 600">做空策略回测结果 (仅告警，不自动交易)</span>
+        </el-divider>
+        <el-row :gutter="16" style="margin-bottom: 16px">
+          <el-col :span="6">
+            <el-card shadow="never" style="background: #1d1e1f; border-color: #333">
+              <div class="metric-card">
+                <div class="metric-label">做空收益</div>
+                <div class="metric-value" :style="{ color: result.short_metrics.total_return >= 0 ? '#67C23A' : '#F56C6C' }">
+                  {{ result.short_metrics.total_return >= 0 ? '+' : '' }}{{ result.short_metrics.total_return.toFixed(2) }} USDT
+                </div>
+                <div class="metric-sub">
+                  {{ result.short_metrics.total_return_pct >= 0 ? '+' : '' }}{{ result.short_metrics.total_return_pct.toFixed(2) }}%
+                  · {{ result.short_metrics.total_trades }} trades
+                </div>
+              </div>
+            </el-card>
+          </el-col>
+          <el-col :span="6">
+            <el-card shadow="never" style="background: #1d1e1f; border-color: #333">
+              <div class="metric-card">
+                <div class="metric-label">做空胜率</div>
+                <div class="metric-value" style="color: #f0b90b">{{ (result.short_metrics.win_rate * 100).toFixed(1) }}%</div>
+                <div class="metric-sub">{{ result.short_metrics.win_trades }}W / {{ result.short_metrics.lose_trades }}L</div>
+              </div>
+            </el-card>
+          </el-col>
+          <el-col :span="6">
+            <el-card shadow="never" style="background: #1d1e1f; border-color: #333">
+              <div class="metric-card">
+                <div class="metric-label">做空平均盈亏</div>
+                <div class="metric-value" style="color: #67C23A">${{ result.short_metrics.avg_win.toFixed(2) }}</div>
+                <div class="metric-sub">Avg Loss: ${{ result.short_metrics.avg_loss.toFixed(2) }}</div>
+              </div>
+            </el-card>
+          </el-col>
+          <el-col :span="6">
+            <el-card shadow="never" style="background: #1d1e1f; border-color: #333">
+              <div class="metric-card">
+                <div class="metric-label">做空Profit Factor</div>
+                <div class="metric-value" style="color: #e0e0e0">{{ result.short_metrics.profit_factor.toFixed(2) }}</div>
+                <div class="metric-sub">Fees: ${{ result.short_metrics.total_fees.toFixed(2) }}</div>
+              </div>
+            </el-card>
+          </el-col>
+        </el-row>
+
+        <el-card shadow="never" style="background: #1d1e1f; border-color: #333">
+          <template #header>
+            <span style="color: #e0e0e0">做空交易记录 ({{ result.short_trades.length }})</span>
+          </template>
+          <el-table
+            :data="result.short_trades"
+            style="width: 100%"
+            size="small"
+            max-height="400"
+            :header-cell-style="{ background: '#252526', color: '#b0b0b0' }"
+            :cell-style="tradeCellStyle"
+          >
+            <el-table-column label="Time" width="160">
+              <template #default="{ row }">{{ formatTime(row.timestamp) }}</template>
+            </el-table-column>
+            <el-table-column prop="side" label="Side" width="80">
+              <template #default="{ row }">
+                <el-tag :type="row.side === 'SHORT' ? 'warning' : 'info'" size="small">{{ row.side }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="Price" width="100">
+              <template #default="{ row }">{{ formatPrice(row.price) }}</template>
+            </el-table-column>
+            <el-table-column label="Qty" width="100">
+              <template #default="{ row }">{{ row.quantity.toFixed(6) }}</template>
+            </el-table-column>
+            <el-table-column label="Fee (U)" width="80">
+              <template #default="{ row }">{{ row.fee.toFixed(2) }}</template>
+            </el-table-column>
+            <el-table-column label="PnL (U)" width="100">
+              <template #default="{ row }">
+                <span v-if="row.side === 'COVER'" :style="{ color: row.pnl >= 0 ? '#67C23A' : '#F56C6C' }">
+                  {{ row.pnl >= 0 ? '+' : '' }}{{ row.pnl.toFixed(2) }}
+                </span>
+                <span v-else style="color: #888">-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="Reason" min-width="200" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.reason }}</template>
+            </el-table-column>
+          </el-table>
+        </el-card>
+      </template>
     </template>
 
     <!-- Empty State -->
@@ -399,7 +648,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { createChart, type IChartApi, type ISeriesApi, ColorType } from 'lightweight-charts'
-import { runBacktest as apiRunBacktest, getStrategies, getIndicatorModules, deployStrategy, type BacktestRequest, type BacktestResult, type StrategyInfo, type ModuleMeta, type ParamSchema, type SignalPreset } from '@/api/backtest'
+import { runBacktest as apiRunBacktest, getStrategies, getIndicatorModules, deployStrategy, getStrategyDiagnostics, type BacktestRequest, type BacktestResult, type StrategyInfo, type ModuleMeta, type ParamSchema, type SignalPreset, type StrategyDiagnostics } from '@/api/backtest'
 import http from '@/api/http'
 import { fetchKlines } from '@/api/klines'
 import { SYMBOLS, INTERVALS } from '@/utils/constants'
@@ -435,6 +684,9 @@ const feePct = ref(0.1)
 const loading = ref(false)
 const deploying = ref(false)
 const loadingLive = ref(false)
+const loadingDiag = ref(false)
+const diagVisible = ref(false)
+const diagData = ref<StrategyDiagnostics | null>(null)
 const liveDialogVisible = ref(false)
 const liveConfig = ref<Record<string, any> | null>(null)
 const result = ref<BacktestResult | null>(null)
@@ -468,6 +720,7 @@ const signalGroups = [
   { key: 'position', label: '持仓控制' },
   { key: 'stoploss', label: '止损' },
   { key: 'trend', label: '趋势过滤' },
+  { key: 'short', label: '做空策略 (仅告警)' },
 ]
 
 function getParamsByGroup(group: string): ParamSchema[] {
@@ -695,6 +948,24 @@ async function showLiveStrategy() {
   } finally {
     loadingLive.value = false
   }
+}
+
+async function showDiagnostics() {
+  loadingDiag.value = true
+  try {
+    diagData.value = await getStrategyDiagnostics()
+    diagVisible.value = true
+  } catch (e: any) {
+    ElMessage.error('获取失败: ' + (e.response?.data?.message || e.message))
+  } finally {
+    loadingDiag.value = false
+  }
+}
+
+function formatDiagTime(ts: string) {
+  if (!ts) return ''
+  const d = new Date(ts)
+  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 const tzOffsetSec = -new Date().getTimezoneOffset() * 60
@@ -1029,6 +1300,18 @@ onBeforeUnmount(() => {
 }
 .detail-row span:first-child {
   color: #888;
+}
+
+.diag-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 3px 0;
+  color: #ccc;
+  font-size: 13px;
+}
+.diag-row span:first-child {
+  color: #909399;
 }
 
 :deep(.el-form-item__label) {

@@ -47,6 +47,15 @@ func convertWsKline(e *gobinance.WsKlineEvent) exchange.Kline {
 // --- Order conversion ---
 
 func convertOrder(o *gobinance.CreateOrderResponse) *exchange.Order {
+	filledQty := parseFloat(o.ExecutedQuantity)
+	cumulativeQuote := parseFloat(o.CummulativeQuoteQuantity)
+
+	// Calculate average fill price from cumulative quote / filled quantity
+	var avgPrice float64
+	if filledQty > 0 && cumulativeQuote > 0 {
+		avgPrice = cumulativeQuote / filledQty
+	}
+
 	return &exchange.Order{
 		ID:            o.OrderID,
 		ClientOrderID: o.ClientOrderID,
@@ -56,13 +65,22 @@ func convertOrder(o *gobinance.CreateOrderResponse) *exchange.Order {
 		Status:        convertOrderStatus(o.Status),
 		Price:         parseFloat(o.Price),
 		Quantity:      parseFloat(o.OrigQuantity),
-		FilledQty:     parseFloat(o.ExecutedQuantity),
+		FilledQty:     filledQty,
+		AvgPrice:      avgPrice,
 		CreatedAt:     msToTime(o.TransactTime),
 		UpdatedAt:     msToTime(o.TransactTime),
 	}
 }
 
 func convertQueryOrder(o *gobinance.Order) *exchange.Order {
+	filledQty := parseFloat(o.ExecutedQuantity)
+	cumulativeQuote := parseFloat(o.CummulativeQuoteQuantity)
+
+	var avgPrice float64
+	if filledQty > 0 && cumulativeQuote > 0 {
+		avgPrice = cumulativeQuote / filledQty
+	}
+
 	return &exchange.Order{
 		ID:            o.OrderID,
 		ClientOrderID: o.ClientOrderID,
@@ -72,7 +90,8 @@ func convertQueryOrder(o *gobinance.Order) *exchange.Order {
 		Status:        convertOrderStatus(o.Status),
 		Price:         parseFloat(o.Price),
 		Quantity:      parseFloat(o.OrigQuantity),
-		FilledQty:     parseFloat(o.ExecutedQuantity),
+		FilledQty:     filledQty,
+		AvgPrice:      avgPrice,
 		StopPrice:     parseFloat(o.StopPrice),
 		CreatedAt:     msToTime(o.Time),
 		UpdatedAt:     msToTime(o.UpdateTime),

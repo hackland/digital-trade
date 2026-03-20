@@ -28,6 +28,12 @@ type EngineConfig struct {
 	HTFHistSize int                             // minimum HTF klines needed
 }
 
+// ShortSignalHandler is an optional interface for strategies that support short signals.
+// The backtest engine uses this to update the strategy's virtual short state.
+type ShortSignalHandler interface {
+	OnShortSignalProcessed(action strategy.Action, price float64)
+}
+
 // Engine drives the backtest simulation.
 type Engine struct {
 	cfg      EngineConfig
@@ -59,11 +65,16 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 		return nil, fmt.Errorf("not enough kline data: have %d, need %d", len(klines), histSize)
 	}
 
-	// Track state
+	// Track state — long positions
 	var equityCurve []EquityPoint
 	var tradeRecords []TradeRecord
 	var positionQty float64
 	var avgEntryPrice float64
+
+	// Track state — short positions (virtual, no simulated exchange)
+	var shortTradeRecords []TradeRecord
+	var shortPositionQty float64
+	var shortEntryPrice float64
 
 	symbol := e.cfg.Symbol
 	allocPct := e.cfg.AllocPct
@@ -188,6 +199,53 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 					})
 				}
 			}
+		} else if sig.Action == strategy.Short && shortPositionQty == 0 {
+			// Virtual short entry: compute qty based on available cash (same sizing as long)
+			bal, _ := e.exchange.GetBalance(ctx, "USDT")
+			shortAllocUSDT := bal.Free * allocPct
+			denom := currentBar.Close * (1 + e.cfg.FeeRate)
+			if denom > 0 {
+				qty := shortAllocUSDT / denom
+				if qty > 0 {
+					shortPositionQty = qty
+					shortEntryPrice = currentBar.Close
+					fee := currentBar.Close * qty * e.cfg.FeeRate
+
+					// Notify strategy
+					if shortHandler, ok := e.strat.(ShortSignalHandler); ok {
+						shortHandler.OnShortSignalProcessed(strategy.Short, currentBar.Close)
+					}
+
+					shortTradeRecords = append(shortTradeRecords, TradeRecord{
+						Timestamp: currentBar.OpenTime,
+						Side:      "SHORT",
+						Price:     currentBar.Close,
+						Quantity:  qty,
+						Fee:       fee,
+						Reason:    sig.Reason,
+					})
+				}
+			}
+		} else if sig.Action == strategy.Cover && shortPositionQty > 0 {
+			// Virtual short exit
+			pnl := (shortEntryPrice - currentBar.Close) * shortPositionQty
+			fee := currentBar.Close * shortPositionQty * e.cfg.FeeRate
+
+			if shortHandler, ok := e.strat.(ShortSignalHandler); ok {
+				shortHandler.OnShortSignalProcessed(strategy.Cover, currentBar.Close)
+			}
+
+			shortTradeRecords = append(shortTradeRecords, TradeRecord{
+				Timestamp: currentBar.OpenTime,
+				Side:      "COVER",
+				Price:     currentBar.Close,
+				Quantity:  shortPositionQty,
+				Fee:       fee,
+				PnL:       pnl,
+				Reason:    sig.Reason,
+			})
+			shortPositionQty = 0
+			shortEntryPrice = 0
 		} else if sig.Action == strategy.Sell && positionQty > 0 {
 			order, err := e.exchange.PlaceOrder(ctx, exchange.OrderRequest{
 				Symbol:   symbol,
@@ -223,8 +281,12 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 			}
 		}
 
-		// Record equity point
+		// Record equity point (include virtual short PnL)
 		equity := e.computeEquity(ctx, symbol, currentBar.Close, positionQty)
+		if shortPositionQty > 0 {
+			shortPnL := (shortEntryPrice - currentBar.Close) * shortPositionQty
+			equity += shortPnL
+		}
 		equityCurve = append(equityCurve, EquityPoint{
 			Time:   currentBar.OpenTime,
 			Equity: equity,
@@ -263,6 +325,28 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 		}
 	}
 
+	// Close any remaining short position at the last price
+	if shortPositionQty > 0 {
+		lastPrice := klines[len(klines)-1].Close
+		pnl := (shortEntryPrice - lastPrice) * shortPositionQty
+		fee := lastPrice * shortPositionQty * e.cfg.FeeRate
+
+		if shortHandler, ok := e.strat.(ShortSignalHandler); ok {
+			shortHandler.OnShortSignalProcessed(strategy.Cover, lastPrice)
+		}
+
+		shortTradeRecords = append(shortTradeRecords, TradeRecord{
+			Timestamp: klines[len(klines)-1].OpenTime,
+			Side:      "COVER",
+			Price:     lastPrice,
+			Quantity:  shortPositionQty,
+			Fee:       fee,
+			PnL:       pnl,
+			Reason:    "backtest end: close short position",
+		})
+		shortPositionQty = 0
+	}
+
 	// Compute final equity
 	finalEquity := e.computeEquity(ctx, symbol, klines[len(klines)-1].Close, 0)
 	if len(equityCurve) > 0 {
@@ -279,19 +363,24 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 
 	metrics := ComputeMetrics(simTrades, equityCurve, e.cfg.InitialCash, duration)
 
+	// Compute short metrics if there were short trades
+	shortMetrics := ComputeShortMetrics(shortTradeRecords, e.cfg.InitialCash)
+
 	result := &Result{
-		Symbol:      symbol,
-		Strategy:    e.strat.Name(),
-		Interval:    e.cfg.Interval,
-		StartTime:   startTime,
-		EndTime:     endTime,
-		Duration:    duration,
-		InitialCash: e.cfg.InitialCash,
-		FeeRate:     e.cfg.FeeRate,
-		AllocPct:    allocPct,
-		Trades:      tradeRecords,
-		Metrics:     metrics,
-		EquityCurve: equityCurve,
+		Symbol:       symbol,
+		Strategy:     e.strat.Name(),
+		Interval:     e.cfg.Interval,
+		StartTime:    startTime,
+		EndTime:      endTime,
+		Duration:     duration,
+		InitialCash:  e.cfg.InitialCash,
+		FeeRate:      e.cfg.FeeRate,
+		AllocPct:     allocPct,
+		Trades:       tradeRecords,
+		Metrics:      metrics,
+		EquityCurve:  equityCurve,
+		ShortTrades:  shortTradeRecords,
+		ShortMetrics: shortMetrics,
 	}
 
 	e.logger.Info("backtest complete",

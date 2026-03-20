@@ -36,6 +36,13 @@ type Manager struct {
 	tpOrders      map[string]int64   // symbol → TP order ID
 	trailingHighs map[string]float64 // symbol → highest price since entry (for trailing stop)
 	lastATR       map[string]float64 // symbol → ATR at signal time (for dynamic SL/TP)
+
+	// Alert dedup: only alert once per breach until price recovers
+	emergencyAlerted map[string]bool // entry-based loss alert
+	drawdownAlerted  map[string]bool // peak-based drawdown alert
+
+	// Exchange symbol info cache (for quantity/price precision)
+	symbolInfo map[string]exchange.SymbolInfo
 }
 
 // NewManager creates a new order manager.
@@ -48,18 +55,87 @@ func NewManager(
 	logger *zap.Logger,
 ) *Manager {
 	return &Manager{
-		exchange:      ex,
-		risk:          riskMgr,
-		position:      pos,
-		store:         store,
-		bus:           bus,
-		logger:        logger,
-		activeOrders:  make(map[int64]*exchange.Order),
-		slOrders:      make(map[string]int64),
-		tpOrders:      make(map[string]int64),
-		trailingHighs: make(map[string]float64),
-		lastATR:       make(map[string]float64),
+		exchange:         ex,
+		risk:             riskMgr,
+		position:         pos,
+		store:            store,
+		bus:              bus,
+		logger:           logger,
+		activeOrders:     make(map[int64]*exchange.Order),
+		slOrders:         make(map[string]int64),
+		tpOrders:         make(map[string]int64),
+		trailingHighs:    make(map[string]float64),
+		lastATR:          make(map[string]float64),
+		emergencyAlerted: make(map[string]bool),
+		drawdownAlerted:  make(map[string]bool),
+		symbolInfo:       make(map[string]exchange.SymbolInfo),
 	}
+}
+
+// LoadSymbolInfo fetches exchange info and caches symbol rules (stepSize, minQty, etc.).
+// Must be called before placing any orders.
+func (m *Manager) LoadSymbolInfo(ctx context.Context) error {
+	info, err := m.exchange.GetExchangeInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("get exchange info: %w", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, si := range info.Symbols {
+		m.symbolInfo[si.Symbol] = si
+		m.logger.Debug("symbol info loaded",
+			zap.String("symbol", si.Symbol),
+			zap.Float64("stepSize", si.StepSize),
+			zap.Float64("minQty", si.MinQty),
+			zap.Float64("minNotional", si.MinNotional),
+		)
+	}
+	return nil
+}
+
+// adjustQuantity truncates quantity to stepSize precision and validates min constraints.
+func (m *Manager) adjustQuantity(symbol string, qty, price float64) (float64, error) {
+	m.mu.RLock()
+	si, ok := m.symbolInfo[symbol]
+	m.mu.RUnlock()
+
+	if !ok || si.StepSize <= 0 {
+		// Fallback: round to 5 decimals (BTCUSDT default)
+		qty = math.Floor(qty*100000) / 100000
+		if qty <= 0 {
+			return 0, fmt.Errorf("quantity too small after rounding")
+		}
+		return qty, nil
+	}
+
+	// Truncate to stepSize (floor, not round — never overshoot balance)
+	steps := math.Floor(qty / si.StepSize)
+	qty = steps * si.StepSize
+
+	// Check minQty
+	if qty < si.MinQty {
+		return 0, fmt.Errorf("quantity %.8f below minQty %.8f for %s", qty, si.MinQty, symbol)
+	}
+
+	// Check minNotional (order value must exceed minimum, e.g., $5)
+	if si.MinNotional > 0 && qty*price < si.MinNotional {
+		return 0, fmt.Errorf("notional %.2f below minimum %.2f for %s", qty*price, si.MinNotional, symbol)
+	}
+
+	return qty, nil
+}
+
+// adjustPrice truncates price to tick precision.
+func (m *Manager) adjustPrice(symbol string, price float64) float64 {
+	m.mu.RLock()
+	si, ok := m.symbolInfo[symbol]
+	m.mu.RUnlock()
+
+	if !ok || si.PricePrecision <= 0 {
+		return roundPrice(price) // fallback to 2 decimals
+	}
+	factor := math.Pow(10, float64(si.PricePrecision))
+	return math.Floor(price*factor) / factor
 }
 
 // SetRiskConfig allows injecting the risk config for SL/TP settings.
@@ -71,6 +147,11 @@ func (m *Manager) SetRiskConfig(cfg config.RiskConfig) {
 func (m *Manager) ProcessSignal(ctx context.Context, sig *strategy.Signal) error {
 	if sig.Action == strategy.Hold {
 		return nil
+	}
+
+	// Short/Cover signals are alert-only, never execute orders
+	if sig.Action.IsShort() {
+		return fmt.Errorf("short/cover signals are alert-only, not executable via order manager")
 	}
 
 	// Build order request from signal
@@ -175,10 +256,15 @@ func (m *Manager) ProcessSignal(ctx context.Context, sig *strategy.Signal) error
 	return nil
 }
 
-// Run starts listening for user data events and kline updates for trailing stop.
+// Run starts listening for user data events, kline updates for trailing stop,
+// and polls open order status (fallback for deprecated userDataStream).
 func (m *Manager) Run(ctx context.Context) error {
 	userDataCh := m.bus.Subscribe(eventbus.EventAccountUpdate, 100)
 	klineCh := m.bus.Subscribe(eventbus.EventKlineUpdate, 1000)
+
+	// Poll open orders every 10 seconds as fallback for broken userDataStream
+	pollTicker := time.NewTicker(10 * time.Second)
+	defer pollTicker.Stop()
 
 	for {
 		select {
@@ -196,11 +282,48 @@ func (m *Manager) Run(ctx context.Context) error {
 				return nil
 			}
 			if ke, ok := evt.Payload.(eventbus.KlineEvent); ok {
-				// Only check trailing stop on 1m klines for responsiveness
+				// Only check on 1m klines for responsiveness
 				if ke.Interval == "1m" {
 					m.checkTrailingStop(ctx, ke.Symbol, ke.Kline.Close)
+					m.checkEmergencyStop(ctx, ke.Symbol, ke.Kline.Close)
+					m.checkPeakDrawdownAlert(ctx, ke.Symbol, ke.Kline.Close)
 				}
 			}
+		case <-pollTicker.C:
+			m.pollActiveOrders(ctx)
+		}
+	}
+}
+
+// pollActiveOrders checks each tracked active order via REST API.
+// This is the fallback mechanism for when userDataStream is unavailable (410 Gone).
+func (m *Manager) pollActiveOrders(ctx context.Context) {
+	m.mu.RLock()
+	ordersCopy := make(map[int64]*exchange.Order, len(m.activeOrders))
+	for id, o := range m.activeOrders {
+		ordersCopy[id] = o
+	}
+	m.mu.RUnlock()
+
+	if len(ordersCopy) == 0 {
+		return
+	}
+
+	for id, tracked := range ordersCopy {
+		order, err := m.exchange.GetOrder(ctx, tracked.Symbol, id)
+		if err != nil {
+			m.logger.Debug("poll order status failed", zap.Int64("order_id", id), zap.Error(err))
+			continue
+		}
+
+		// Only process if status changed
+		if order.Status != tracked.Status {
+			m.logger.Info("order status changed (poll)",
+				zap.Int64("order_id", id),
+				zap.String("old_status", tracked.Status.String()),
+				zap.String("new_status", order.Status.String()),
+			)
+			m.handleOrderUpdate(ctx, order)
 		}
 	}
 }
@@ -278,14 +401,28 @@ func (m *Manager) buildOrderRequest(ctx context.Context, sig *strategy.Signal) (
 		}
 		allocUSDT := balance.Free * allocPct
 
+		// 预留手续费空间 (Binance 现货 0.1% taker fee)
+		// 确保下单后还有余额支付手续费
+		feeReserve := 1.0 + 0.001 // 0.1% fee
 		if ticker.AskPrice > 0 {
-			req.Quantity = allocUSDT / ticker.AskPrice
+			req.Quantity = allocUSDT / (ticker.AskPrice * feeReserve)
 		}
+
+		// 按 stepSize 截断并检查最小值
+		adjQty, err := m.adjustQuantity(sig.Symbol, req.Quantity, ticker.AskPrice)
+		if err != nil {
+			return nil, fmt.Errorf("adjust buy quantity: %w", err)
+		}
+		req.Quantity = adjQty
 	} else {
 		// 卖出: 使用当前持仓全部数量
 		pos := m.position.GetPosition(sig.Symbol)
 		if pos.Quantity > 0 {
-			req.Quantity = pos.Quantity
+			adjQty, err := m.adjustQuantity(sig.Symbol, pos.Quantity, ticker.BidPrice)
+			if err != nil {
+				return nil, fmt.Errorf("adjust sell quantity: %w", err)
+			}
+			req.Quantity = adjQty
 		} else {
 			return nil, fmt.Errorf("no position to sell for %s", sig.Symbol)
 		}
@@ -668,6 +805,119 @@ func (m *Manager) checkTrailingStop(ctx context.Context, symbol string, currentP
 		Payload: eventbus.RiskAlertEvent{
 			Rule:    "trailing_stop",
 			Message: fmt.Sprintf("trailing stop triggered for %s at %.2f (high: %.2f)", symbol, currentPrice, highPrice),
+			Level:   "warning",
+		},
+	})
+}
+
+// checkEmergencyStop monitors unrealized loss on every 1m kline.
+// When loss exceeds emergency_stop_pct, it sends an alert (Telegram + event bus)
+// but does NOT auto-sell — spot positions don't get liquidated, and flash crashes
+// often V-shape recover. The human decides whether to intervene.
+func (m *Manager) checkEmergencyStop(ctx context.Context, symbol string, currentPrice float64) {
+	if m.riskCfg.EmergencyAlertPct <= 0 {
+		return
+	}
+
+	pos := m.position.GetPosition(symbol)
+	if pos.Quantity <= 0 || pos.AvgEntryPrice <= 0 {
+		return
+	}
+
+	lossPct := (pos.AvgEntryPrice - currentPrice) / pos.AvgEntryPrice
+	if lossPct < m.riskCfg.EmergencyAlertPct {
+		// Price recovered above threshold — reset alert so it can fire again
+		m.mu.Lock()
+		delete(m.emergencyAlerted, symbol)
+		m.mu.Unlock()
+		return
+	}
+
+	// Deduplicate: only alert once per breach (until price recovers above threshold)
+	m.mu.Lock()
+	if m.emergencyAlerted[symbol] {
+		m.mu.Unlock()
+		return
+	}
+	m.emergencyAlerted[symbol] = true
+	m.mu.Unlock()
+
+	m.logger.Warn("EMERGENCY ALERT: large unrealized loss",
+		zap.String("symbol", symbol),
+		zap.Float64("current_price", currentPrice),
+		zap.Float64("entry_price", pos.AvgEntryPrice),
+		zap.Float64("loss_pct", lossPct*100),
+		zap.Float64("threshold_pct", m.riskCfg.EmergencyAlertPct*100),
+	)
+
+	m.bus.Publish(eventbus.Event{
+		Type:      eventbus.EventRiskAlert,
+		Timestamp: time.Now(),
+		Payload: eventbus.RiskAlertEvent{
+			Rule:    "emergency_alert",
+			Message: fmt.Sprintf("⚠️ %s 浮亏 %.1f%% (入场=%.2f, 现价=%.2f, 阈值=%.0f%%), 请关注是否需要手动平仓", symbol, lossPct*100, pos.AvgEntryPrice, currentPrice, m.riskCfg.EmergencyAlertPct*100),
+			Level:   "critical",
+		},
+	})
+}
+
+// checkPeakDrawdownAlert monitors price drop from the highest point since entry.
+// Protects unrealized profit: e.g., up 10% then drops 8% from peak → alert.
+// Uses trailingHighs which is already updated by checkTrailingStop.
+func (m *Manager) checkPeakDrawdownAlert(ctx context.Context, symbol string, currentPrice float64) {
+	if m.riskCfg.PeakDrawdownAlertPct <= 0 {
+		return
+	}
+
+	pos := m.position.GetPosition(symbol)
+	if pos.Quantity <= 0 {
+		return
+	}
+
+	m.mu.RLock()
+	highPrice := m.trailingHighs[symbol]
+	m.mu.RUnlock()
+
+	if highPrice <= 0 {
+		return
+	}
+
+	drawdownPct := (highPrice - currentPrice) / highPrice
+	if drawdownPct < m.riskCfg.PeakDrawdownAlertPct {
+		// Below threshold — reset alert
+		m.mu.Lock()
+		delete(m.drawdownAlerted, symbol)
+		m.mu.Unlock()
+		return
+	}
+
+	// Deduplicate
+	m.mu.Lock()
+	if m.drawdownAlerted[symbol] {
+		m.mu.Unlock()
+		return
+	}
+	m.drawdownAlerted[symbol] = true
+	m.mu.Unlock()
+
+	profitFromEntry := (currentPrice - pos.AvgEntryPrice) / pos.AvgEntryPrice * 100
+	profitAtPeak := (highPrice - pos.AvgEntryPrice) / pos.AvgEntryPrice * 100
+
+	m.logger.Warn("PEAK DRAWDOWN ALERT: significant pullback from high",
+		zap.String("symbol", symbol),
+		zap.Float64("peak_price", highPrice),
+		zap.Float64("current_price", currentPrice),
+		zap.Float64("drawdown_pct", drawdownPct*100),
+		zap.Float64("profit_at_peak_pct", profitAtPeak),
+		zap.Float64("profit_now_pct", profitFromEntry),
+	)
+
+	m.bus.Publish(eventbus.Event{
+		Type:      eventbus.EventRiskAlert,
+		Timestamp: time.Now(),
+		Payload: eventbus.RiskAlertEvent{
+			Rule:    "peak_drawdown_alert",
+			Message: fmt.Sprintf("📉 %s 从最高点回撤 %.1f%% (最高=%.2f, 现价=%.2f, 当前盈亏=%.1f%%, 峰值盈利=%.1f%%)", symbol, drawdownPct*100, highPrice, currentPrice, profitFromEntry, profitAtPeak),
 			Level:   "warning",
 		},
 	})

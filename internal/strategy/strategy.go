@@ -14,6 +14,8 @@ const (
 	Hold Action = iota
 	Buy
 	Sell
+	Short // 做空入场（仅告警）
+	Cover // 做空平仓（仅告警）
 )
 
 func (a Action) String() string {
@@ -22,15 +24,24 @@ func (a Action) String() string {
 		return "BUY"
 	case Sell:
 		return "SELL"
+	case Short:
+		return "SHORT"
+	case Cover:
+		return "COVER"
 	default:
 		return "HOLD"
 	}
 }
 
+// IsShort returns true for Short and Cover actions.
+func (a Action) IsShort() bool {
+	return a == Short || a == Cover
+}
+
 // Signal is the output of a strategy evaluation.
 type Signal struct {
 	Action     Action
-	Strength   float64            // 0.0 (weak) to 1.0 (strong)
+	Strength   float64 // 0.0 (weak) to 1.0 (strong)
 	Symbol     string
 	Strategy   string             // Name of the producing strategy
 	Reason     string             // Human-readable explanation

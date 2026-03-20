@@ -12,8 +12,10 @@ import (
 
 // Client implements exchange.Exchange for Binance Spot.
 type Client struct {
-	api    *gobinance.Client
-	logger *zap.Logger
+	api       *gobinance.Client
+	apiKey    string
+	secretKey string
+	logger    *zap.Logger
 }
 
 // NewClient creates a new Binance client.
@@ -24,8 +26,10 @@ func NewClient(apiKey, secretKey string, testnet bool, logger *zap.Logger) *Clie
 	api := gobinance.NewClient(apiKey, secretKey)
 
 	return &Client{
-		api:    api,
-		logger: logger,
+		api:       api,
+		apiKey:    apiKey,
+		secretKey: secretKey,
+		logger:    logger,
 	}
 }
 
@@ -173,11 +177,28 @@ func (c *Client) GetExchangeInfo(ctx context.Context) (*exchange.ExchangeInfo, e
 // --- Orders ---
 
 func (c *Client) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (*exchange.Order, error) {
+	binanceType := toBinanceOrderType(req.Type)
+
+	// Binance Spot does not support pure STOP_LOSS/TAKE_PROFIT market orders.
+	// Must use STOP_LOSS_LIMIT/TAKE_PROFIT_LIMIT with a price + timeInForce.
+	isStopOrder := req.Type == exchange.OrderTypeStopLoss || req.Type == exchange.OrderTypeTakeProfit
+	if isStopOrder {
+		if req.Type == exchange.OrderTypeStopLoss {
+			binanceType = gobinance.OrderTypeStopLossLimit
+		} else {
+			binanceType = gobinance.OrderTypeTakeProfitLimit
+		}
+	}
+
+	// Format quantity with max 8 decimal places (Binance precision limit)
+	// The order manager should have already truncated to stepSize
+	qtyStr := strconv.FormatFloat(req.Quantity, 'f', 8, 64)
+
 	svc := c.api.NewCreateOrderService().
 		Symbol(req.Symbol).
 		Side(toBinanceSide(req.Side)).
-		Type(toBinanceOrderType(req.Type)).
-		Quantity(strconv.FormatFloat(req.Quantity, 'f', -1, 64))
+		Type(binanceType).
+		Quantity(qtyStr)
 
 	if req.Type == exchange.OrderTypeLimit {
 		svc.Price(strconv.FormatFloat(req.Price, 'f', -1, 64))
@@ -188,9 +209,26 @@ func (c *Client) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (*ex
 		svc.TimeInForce(gobinance.TimeInForceType(tif))
 	}
 
-	if req.StopPrice > 0 {
-		svc.StopPrice(strconv.FormatFloat(req.StopPrice, 'f', -1, 64))
+	if isStopOrder {
+		svc.StopPrice(strconv.FormatFloat(req.StopPrice, 'f', 2, 64))
+		// For STOP_LOSS_LIMIT: set limit price slightly worse than stop to ensure fill.
+		// SL sell: limit price = stopPrice * 0.995 (0.5% below stop)
+		// TP sell: limit price = stopPrice * 1.005 (0.5% above stop, ensures fill)
+		limitPrice := req.StopPrice
+		if req.Type == exchange.OrderTypeStopLoss {
+			limitPrice = req.StopPrice * 0.995 // slightly below stop for immediate fill
+		} else {
+			limitPrice = req.StopPrice * 1.005 // slightly above stop
+		}
+		if req.Price > 0 {
+			limitPrice = req.Price // allow explicit override
+		}
+		svc.Price(strconv.FormatFloat(limitPrice, 'f', 2, 64))
+		svc.TimeInForce(gobinance.TimeInForceTypeGTC)
+	} else if req.StopPrice > 0 {
+		svc.StopPrice(strconv.FormatFloat(req.StopPrice, 'f', 2, 64))
 	}
+
 	if req.ClientOrderID != "" {
 		svc.NewClientOrderID(req.ClientOrderID)
 	}
@@ -198,9 +236,10 @@ func (c *Client) PlaceOrder(ctx context.Context, req exchange.OrderRequest) (*ex
 	c.logger.Info("placing order",
 		zap.String("symbol", req.Symbol),
 		zap.String("side", req.Side.String()),
-		zap.String("type", req.Type.String()),
+		zap.String("type", string(binanceType)),
 		zap.Float64("qty", req.Quantity),
 		zap.Float64("price", req.Price),
+		zap.Float64("stop_price", req.StopPrice),
 	)
 
 	resp, err := svc.Do(ctx)

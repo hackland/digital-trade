@@ -242,10 +242,22 @@ func (c *Client) runTradeStream(ctx context.Context, symbol string, ch chan<- ex
 }
 
 // SubscribeUserData subscribes to the user data stream (order updates, balance updates).
+// Uses the new WebSocket API signature method (userDataStream.subscribe.signature).
+// Falls back to legacy listenKey method if the new method fails.
 func (c *Client) SubscribeUserData(ctx context.Context) (<-chan exchange.UserDataEvent, error) {
 	ch := make(chan exchange.UserDataEvent, 100)
 
-	// Start user data stream (get listen key)
+	// Try new WS API signature method first (no listenKey needed)
+	if c.apiKey != "" && c.secretKey != "" {
+		go func() {
+			defer close(ch)
+			c.runUserDataStreamSignature(ctx, ch)
+		}()
+		c.logger.Info("subscribed to user data stream (WS API signature method)")
+		return ch, nil
+	}
+
+	// Fallback: legacy listenKey method
 	listenKey, err := c.api.NewStartUserStreamService().Do(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("start user data stream: %w", err)
@@ -253,7 +265,7 @@ func (c *Client) SubscribeUserData(ctx context.Context) (<-chan exchange.UserDat
 
 	go func() {
 		defer close(ch)
-		c.runUserDataStream(ctx, listenKey, ch)
+		c.runUserDataStreamLegacy(ctx, listenKey, ch)
 	}()
 
 	// Keep listen key alive (every 30 minutes)
@@ -272,12 +284,62 @@ func (c *Client) SubscribeUserData(ctx context.Context) (<-chan exchange.UserDat
 		}
 	}()
 
-	c.logger.Info("subscribed to user data stream")
+	c.logger.Info("subscribed to user data stream (legacy listenKey)")
 	return ch, nil
 }
 
-func (c *Client) runUserDataStream(ctx context.Context, listenKey string, ch chan<- exchange.UserDataEvent) {
+// userDataHandler creates the shared WsUserDataHandler for both stream methods.
+func (c *Client) userDataHandler(ch chan<- exchange.UserDataEvent) gobinance.WsUserDataHandler {
+	return func(event *gobinance.WsUserDataEvent) {
+		evt := exchange.UserDataEvent{}
+
+		switch event.Event {
+		case gobinance.UserDataEventTypeExecutionReport:
+			order := &exchange.Order{
+				ID:            event.OrderUpdate.Id,
+				ClientOrderID: event.OrderUpdate.ClientOrderId,
+				Symbol:        event.OrderUpdate.Symbol,
+				Side:          convertSide(gobinance.SideType(event.OrderUpdate.Side)),
+				Type:          convertOrderType(gobinance.OrderType(event.OrderUpdate.Type)),
+				Status:        convertOrderStatus(gobinance.OrderStatusType(event.OrderUpdate.Status)),
+				Price:         parseFloat(event.OrderUpdate.Price),
+				Quantity:      parseFloat(event.OrderUpdate.Volume),
+				FilledQty:     parseFloat(event.OrderUpdate.FilledVolume),
+				UpdatedAt:     msToTime(event.OrderUpdate.TransactionTime),
+			}
+			evt.Type = "orderUpdate"
+			evt.OrderUpdate = order
+
+		case gobinance.UserDataEventTypeOutboundAccountPosition:
+			for _, b := range event.AccountUpdate.WsAccountUpdates {
+				bal := &exchange.Balance{
+					Asset:  b.Asset,
+					Free:   parseFloat(b.Free),
+					Locked: parseFloat(b.Locked),
+				}
+				evt.Type = "balanceUpdate"
+				evt.BalanceUpdate = bal
+			}
+		}
+
+		if evt.Type != "" {
+			select {
+			case ch <- evt:
+			default:
+			}
+		}
+	}
+}
+
+// runUserDataStreamSignature uses the new WS API method (no listenKey).
+// This replaces the deprecated POST /api/v3/userDataStream endpoint.
+func (c *Client) runUserDataStreamSignature(ctx context.Context, ch chan<- exchange.UserDataEvent) {
 	backoff := newExponentialBackoff(time.Second, time.Minute)
+	handler := c.userDataHandler(ch)
+
+	errHandler := func(err error) {
+		c.logger.Error("user data ws error", zap.Error(err))
+	}
 
 	for {
 		select {
@@ -286,48 +348,56 @@ func (c *Client) runUserDataStream(ctx context.Context, listenKey string, ch cha
 		default:
 		}
 
-		handler := func(event *gobinance.WsUserDataEvent) {
-			evt := exchange.UserDataEvent{}
-
-			switch event.Event {
-			case gobinance.UserDataEventTypeExecutionReport:
-				order := &exchange.Order{
-					ID:            event.OrderUpdate.Id,
-					ClientOrderID: event.OrderUpdate.ClientOrderId,
-					Symbol:        event.OrderUpdate.Symbol,
-					Side:          convertSide(gobinance.SideType(event.OrderUpdate.Side)),
-					Type:          convertOrderType(gobinance.OrderType(event.OrderUpdate.Type)),
-					Status:        convertOrderStatus(gobinance.OrderStatusType(event.OrderUpdate.Status)),
-					Price:         parseFloat(event.OrderUpdate.Price),
-					Quantity:      parseFloat(event.OrderUpdate.Volume),
-					FilledQty:     parseFloat(event.OrderUpdate.FilledVolume),
-					UpdatedAt:     msToTime(event.OrderUpdate.TransactionTime),
-				}
-				evt.Type = "orderUpdate"
-				evt.OrderUpdate = order
-
-			case gobinance.UserDataEventTypeOutboundAccountPosition:
-				for _, b := range event.AccountUpdate.WsAccountUpdates {
-					bal := &exchange.Balance{
-						Asset:  b.Asset,
-						Free:   parseFloat(b.Free),
-						Locked: parseFloat(b.Locked),
-					}
-					evt.Type = "balanceUpdate"
-					evt.BalanceUpdate = bal
-				}
-			}
-
-			if evt.Type != "" {
-				select {
-				case ch <- evt:
-				default:
-				}
+		// WsUserDataServeSignature(apiKey, secretKey, keyType, timeOffset, handler, errHandler)
+		// keyType: "HMAC" for HMAC-SHA256 API keys
+		doneC, stopC, err := gobinance.WsUserDataServeSignature(
+			c.apiKey, c.secretKey, "HMAC", 0, handler, errHandler,
+		)
+		if err != nil {
+			c.logger.Error("failed to start user data ws (signature)",
+				zap.Error(err),
+				zap.Duration("backoff", backoff.Current()),
+			)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff.Next()):
+				continue
 			}
 		}
 
-		errHandler := func(err error) {
-			c.logger.Error("user data ws error", zap.Error(err))
+		backoff.Reset()
+		c.logger.Info("user data ws connected (signature method)")
+
+		select {
+		case <-ctx.Done():
+			close(stopC)
+			return
+		case <-doneC:
+			c.logger.Warn("user data ws disconnected, reconnecting")
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff.Next()):
+			}
+		}
+	}
+}
+
+// runUserDataStreamLegacy uses the old listenKey-based method.
+func (c *Client) runUserDataStreamLegacy(ctx context.Context, listenKey string, ch chan<- exchange.UserDataEvent) {
+	backoff := newExponentialBackoff(time.Second, time.Minute)
+	handler := c.userDataHandler(ch)
+
+	errHandler := func(err error) {
+		c.logger.Error("user data ws error", zap.Error(err))
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
 
 		doneC, stopC, err := gobinance.WsUserDataServe(listenKey, handler, errHandler)
@@ -341,7 +411,7 @@ func (c *Client) runUserDataStream(ctx context.Context, listenKey string, ch cha
 		}
 
 		backoff.Reset()
-		c.logger.Info("user data ws connected")
+		c.logger.Info("user data ws connected (legacy)")
 
 		select {
 		case <-ctx.Done():

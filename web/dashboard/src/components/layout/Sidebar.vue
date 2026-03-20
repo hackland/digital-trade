@@ -27,6 +27,10 @@
       <el-icon><DataAnalysis /></el-icon>
       <span>Backtest</span>
     </el-menu-item>
+    <el-menu-item index="/short-strategy">
+      <el-icon><Bottom /></el-icon>
+      <span>Short Strategy</span>
+    </el-menu-item>
     <el-menu-item index="/risk">
       <el-icon><Warning /></el-icon>
       <span>Risk</span>
@@ -40,7 +44,7 @@
 
 <script setup lang="ts">
 import { useRoute } from 'vue-router'
-import { Odometer, TrendCharts, List, Tickets, Aim, DataAnalysis, Warning, Setting } from '@element-plus/icons-vue'
+import { Odometer, TrendCharts, List, Tickets, Aim, DataAnalysis, Warning, Setting, Bottom } from '@element-plus/icons-vue'
 
 const route = useRoute()
 </script>

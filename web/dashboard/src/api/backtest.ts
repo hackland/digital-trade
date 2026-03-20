@@ -26,7 +26,7 @@ export interface ParamSchema {
   min: number
   max: number
   step: number
-  group?: string  // "signal" | "position" | "stoploss" | "trend"
+  group?: string  // "signal" | "position" | "stoploss" | "trend" | "short"
   desc?: string   // tooltip help text
 }
 
@@ -101,6 +101,8 @@ export interface BacktestResult {
   trades: TradeRecord[]
   metrics: BacktestMetrics
   equity_curve: EquityPoint[]
+  short_trades: TradeRecord[]
+  short_metrics: BacktestMetrics
 }
 
 export interface StrategyInfo {
@@ -135,5 +137,44 @@ export interface DeployResponse {
 
 export async function deployStrategy(req: DeployRequest): Promise<DeployResponse> {
   const res = await http.post<ApiResponse<DeployResponse>>('/strategy/deploy', req)
+  return res.data.data
+}
+
+export interface StrategyDiagnostics {
+  message?: string  // when no eval has happened yet
+  timestamp: string
+  symbol: string
+  action: string
+  composite_score: number
+  module_scores: Record<string, number>
+  module_weights: Record<string, number>
+  buy_threshold: number
+  sell_threshold: number
+  has_position: boolean
+  entry_price: number
+  high_water_mark: number
+  bars_since_entry: number
+  confirm_count: number
+  confirm_bars: number
+  cooldown_count: number
+  cooldown_bars: number
+  min_hold_bars: number
+  trend_filter_on: boolean
+  trend_bullish: boolean
+  trend_ema_dist_pct: number
+  htf_enabled: boolean
+  htf_bullish: boolean
+  htf_blocked: boolean
+  htf_ema_dist_pct: number
+  atr_stop_mult: number
+  atr_value: number
+  stop_price: number
+  close_price: number
+  hold_reason: string
+  reason: string
+}
+
+export async function getStrategyDiagnostics(): Promise<StrategyDiagnostics> {
+  const res = await http.get<ApiResponse<StrategyDiagnostics>>('/strategy/diagnostics')
   return res.data.data
 }

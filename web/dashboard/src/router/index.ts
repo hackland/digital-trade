@@ -13,6 +13,7 @@ const router = createRouter({
         { path: 'trades', name: 'trades', component: () => import('@/views/TradesView.vue') },
         { path: 'signals', name: 'signals', component: () => import('@/views/SignalsView.vue') },
         { path: 'backtest', name: 'backtest', component: () => import('@/views/BacktestView.vue') },
+        { path: 'short-strategy', name: 'short-strategy', component: () => import('@/views/ShortStrategyView.vue') },
         { path: 'risk', name: 'risk', component: () => import('@/views/RiskView.vue') },
         { path: 'settings', name: 'settings', component: () => import('@/views/SettingsView.vue') },
       ],

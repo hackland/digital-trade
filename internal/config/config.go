@@ -72,6 +72,14 @@ type RiskConfig struct {
 	MinOrderSizeUSDT     float64       `mapstructure:"min_order_size_usdt"`
 	MaxSlippagePct       float64       `mapstructure:"max_slippage_pct"`
 	MinTimeBetweenOrders time.Duration `mapstructure:"min_time_between_orders"`
+
+	// Emergency alert: send Telegram warning if unrealized loss from ENTRY exceeds this % (checked every 1m)
+	// Protects capital. Alert only, no auto-sell. 0 = disabled.
+	EmergencyAlertPct float64 `mapstructure:"emergency_alert_pct"`
+
+	// Peak drawdown alert: send Telegram warning if price drops this % from HIGHEST since entry (checked every 1m)
+	// Protects unrealized profit. Alert only, no auto-sell. 0 = disabled.
+	PeakDrawdownAlertPct float64 `mapstructure:"peak_drawdown_alert_pct"`
 }
 
 type DashboardConfig struct {

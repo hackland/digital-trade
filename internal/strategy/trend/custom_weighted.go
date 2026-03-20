@@ -60,6 +60,65 @@ type CustomWeightedStrategy struct {
 	highWaterMark  float64
 	entryPrice     float64
 	barsSinceEntry int
+
+	// --- Short signal parameters (alert-only, independent of long) ---
+	shortEnabled      bool
+	shortThreshold    float64 // composite < this → Short signal
+	coverThreshold    float64 // composite > this → Cover signal
+	shortConfirmBars  int
+	shortMinHoldBars  int
+	shortATRStopMult  float64
+	shortCooldownBars int
+
+	// Short runtime state (virtual position for signal tracking)
+	shortConfirmCount   int
+	shortCooldownCount  int
+	inShortPosition     bool
+	shortEntryPrice     float64
+	shortLowWaterMark   float64 // lowest price since short entry (for trailing stop)
+	shortBarsSinceEntry int
+
+	// Last evaluation diagnostics (updated every Evaluate call)
+	lastDiag *Diagnostics
+}
+
+// Diagnostics holds the latest strategy evaluation state for live monitoring.
+type Diagnostics struct {
+	Timestamp      string             `json:"timestamp"` // last eval time
+	Symbol         string             `json:"symbol"`
+	Action         string             `json:"action"` // last signal action
+	CompositeScore float64            `json:"composite_score"`
+	ModuleScores   map[string]float64 `json:"module_scores"`  // module → raw score
+	ModuleWeights  map[string]float64 `json:"module_weights"` // module → weight
+	BuyThreshold   float64            `json:"buy_threshold"`
+	SellThreshold  float64            `json:"sell_threshold"`
+	// Runtime state
+	HasPosition    bool    `json:"has_position"`
+	EntryPrice     float64 `json:"entry_price"`
+	HighWaterMark  float64 `json:"high_water_mark"`
+	BarsSinceEntry int     `json:"bars_since_entry"`
+	ConfirmCount   int     `json:"confirm_count"`
+	ConfirmBars    int     `json:"confirm_bars"`
+	CooldownCount  int     `json:"cooldown_count"`
+	CooldownBars   int     `json:"cooldown_bars"`
+	MinHoldBars    int     `json:"min_hold_bars"`
+	// Trend filter
+	TrendFilterOn bool    `json:"trend_filter_on"`
+	TrendBullish  bool    `json:"trend_bullish"`
+	TrendEMADist  float64 `json:"trend_ema_dist_pct"`
+	// HTF filter
+	HTFEnabled bool    `json:"htf_enabled"`
+	HTFBullish bool    `json:"htf_bullish"`
+	HTFBlocked bool    `json:"htf_blocked"`
+	HTFEMADist float64 `json:"htf_ema_dist_pct"`
+	// ATR stop
+	ATRStopMult float64 `json:"atr_stop_mult"`
+	ATRValue    float64 `json:"atr_value"`
+	StopPrice   float64 `json:"stop_price"`
+	ClosePrice  float64 `json:"close_price"`
+	// Reason (human readable)
+	HoldReason string `json:"hold_reason"`
+	Reason     string `json:"reason"`
 }
 
 type weightedMod struct {
@@ -81,6 +140,14 @@ func NewCustomWeightedStrategy() *CustomWeightedStrategy {
 		minHoldBars:        6,
 		atrStopMult:        3.0,
 		atrPeriod:          14,
+		// Short defaults
+		shortEnabled:      false,
+		shortThreshold:    -0.25,
+		coverThreshold:    0.15,
+		shortConfirmBars:  1,
+		shortMinHoldBars:  12,
+		shortATRStopMult:  3.0,
+		shortCooldownBars: 4,
 	}
 }
 
@@ -100,6 +167,13 @@ func (s *CustomWeightedStrategy) Reconfigure(cfg map[string]interface{}) error {
 	s.barsSinceEntry = 0
 	s.highWaterMark = 0
 	s.entryPrice = 0
+	// Reset short state
+	s.shortConfirmCount = 0
+	s.shortCooldownCount = 0
+	s.inShortPosition = false
+	s.shortEntryPrice = 0
+	s.shortLowWaterMark = 0
+	s.shortBarsSinceEntry = 0
 	s.weightedModules = nil // Clear modules before re-init
 
 	return s.init(cfg)
@@ -132,7 +206,22 @@ func (s *CustomWeightedStrategy) GetConfig() map[string]interface{} {
 		"htf_enabled":    s.htfEnabled,
 		"htf_interval":   s.htfInterval,
 		"htf_period":     s.htfPeriod,
+		// Short params
+		"short_enabled":       s.shortEnabled,
+		"short_threshold":     s.shortThreshold,
+		"cover_threshold":     s.coverThreshold,
+		"short_confirm_bars":  s.shortConfirmBars,
+		"short_min_hold_bars": s.shortMinHoldBars,
+		"short_atr_stop_mult": s.shortATRStopMult,
+		"short_cooldown_bars": s.shortCooldownBars,
 	}
+}
+
+// GetDiagnostics returns the latest evaluation diagnostics. Thread-safe.
+func (s *CustomWeightedStrategy) GetDiagnostics() *Diagnostics {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastDiag
 }
 
 func (s *CustomWeightedStrategy) Init(cfg map[string]interface{}) error {
@@ -180,6 +269,29 @@ func (s *CustomWeightedStrategy) init(cfg map[string]interface{}) error {
 	}
 	if v, ok := cfg["htf_period"]; ok {
 		s.htfPeriod = toInt(v)
+	}
+
+	// Short parameters
+	if v, ok := cfg["short_enabled"]; ok {
+		s.shortEnabled = toBool(v)
+	}
+	if v, ok := cfg["short_threshold"]; ok {
+		s.shortThreshold = toFloat(v)
+	}
+	if v, ok := cfg["cover_threshold"]; ok {
+		s.coverThreshold = toFloat(v)
+	}
+	if v, ok := cfg["short_confirm_bars"]; ok {
+		s.shortConfirmBars = toInt(v)
+	}
+	if v, ok := cfg["short_min_hold_bars"]; ok {
+		s.shortMinHoldBars = toInt(v)
+	}
+	if v, ok := cfg["short_atr_stop_mult"]; ok {
+		s.shortATRStopMult = toFloat(v)
+	}
+	if v, ok := cfg["short_cooldown_bars"]; ok {
+		s.shortCooldownBars = toInt(v)
 	}
 
 	// Parse modules from config
@@ -347,6 +459,8 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 	totalWeight := 0.0
 	var scoreParts []string
 
+	moduleScores := make(map[string]float64)
+	moduleWeights := make(map[string]float64)
 	for _, wm := range s.weightedModules {
 		score := wm.module.Score(snap)
 		weighted := score * wm.weight
@@ -355,6 +469,8 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 
 		sig.Indicators[wm.module.Name()+"_score"] = score
 		scoreParts = append(scoreParts, fmt.Sprintf("%s=%.2f", wm.module.Name(), score))
+		moduleScores[wm.module.Name()] = score
+		moduleWeights[wm.module.Name()] = wm.weight
 	}
 
 	// Normalize if weights don't sum to 1
@@ -373,13 +489,12 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 
 	// Trend filter: check if price is above long-term EMA
 	trendBullish := true // default: no filter
+	trendDist := 0.0
 	if s.trendFilterEnabled && s.trendPeriod > 0 {
 		trendEMA := snap.Indicators.EMA[s.trendPeriod]
 		if trendEMA > 0 && closePrice > 0 {
-			// Price must be above EMA to be bullish
 			trendBullish = closePrice > trendEMA
-			// Also track how far above/below (for signal indicator logging)
-			trendDist := (closePrice - trendEMA) / trendEMA * 100
+			trendDist = (closePrice - trendEMA) / trendEMA * 100
 			sig.Indicators["trend_ema_dist_pct"] = trendDist
 			sig.Indicators["trend_bullish"] = boolToFloat(trendBullish)
 		}
@@ -387,51 +502,52 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 
 	// Multi-timeframe trend filter: check if higher TF is bullish
 	htfBullish := true // default: no filter
+	htfBlocked := false
+	htfDist := 0.0
 	if s.htfEnabled && len(snap.HTFKlines) > 0 {
 		htfEMA := snap.HTFIndicators.EMA[s.htfPeriod]
 		htfPrice := snap.HTFKlines[len(snap.HTFKlines)-1].Close
 		if htfEMA > 0 && htfPrice > 0 {
 			htfBullish = htfPrice > htfEMA
-			sig.Indicators["htf_ema_dist_pct"] = (htfPrice - htfEMA) / htfEMA * 100
+			htfDist = (htfPrice - htfEMA) / htfEMA * 100
+			sig.Indicators["htf_ema_dist_pct"] = htfDist
 			sig.Indicators["htf_bullish"] = boolToFloat(htfBullish)
 		}
 	}
 
+	// holdReason tracks why no buy/sell was triggered (for diagnostics)
+	holdReason := ""
+	stopPrice := 0.0
+
 	// --- BUY LOGIC ---
 	if !hasPosition {
-		// Cooldown check
 		if s.cooldownCount > 0 {
+			holdReason = fmt.Sprintf("冷却期中，剩余 %d 根K线", s.cooldownCount)
 			s.cooldownCount--
-			return sig, nil
-		}
-
-		// Trend filter gate: don't even accumulate confirmCount in bear market
-		if !trendBullish {
+		} else if !trendBullish {
+			holdReason = fmt.Sprintf("趋势过滤：价格低于EMA(%d)，距离 %.2f%%", s.trendPeriod, trendDist)
 			s.confirmCount = 0
-			return sig, nil
-		}
-
-		// Multi-TF gate: higher timeframe must also be bullish
-		if !htfBullish {
+		} else if !htfBullish {
+			holdReason = fmt.Sprintf("大周期过滤：HTF价格低于EMA(%d)，距离 %.2f%%", s.htfPeriod, htfDist)
 			s.confirmCount = 0
+			htfBlocked = true
 			sig.Indicators["htf_blocked"] = 1.0
-			return sig, nil
-		}
-
-		if composite >= s.buyThreshold {
-			s.confirmCount++
+		} else if composite < s.buyThreshold {
+			holdReason = fmt.Sprintf("综合评分 %.3f 未达买入阈值 %.2f（差 %.3f）", composite, s.buyThreshold, s.buyThreshold-composite)
+			s.confirmCount = 0
 		} else {
-			s.confirmCount = 0
-		}
-
-		if s.confirmCount >= s.confirmBars {
-			sig.Action = strategy.Buy
-			sig.Strength = clamp(composite, 0.1, 1.0)
-			sig.Reason = fmt.Sprintf(
-				"Custom buy (score=%.2f, threshold=%.2f): %s",
-				composite, s.buyThreshold, strings.Join(scoreParts, ", "),
-			)
-			s.confirmCount = 0
+			s.confirmCount++
+			if s.confirmCount >= s.confirmBars {
+				sig.Action = strategy.Buy
+				sig.Strength = clamp(composite, 0.1, 1.0)
+				sig.Reason = fmt.Sprintf(
+					"Custom buy (score=%.2f, threshold=%.2f): %s",
+					composite, s.buyThreshold, strings.Join(scoreParts, ", "),
+				)
+				s.confirmCount = 0
+			} else {
+				holdReason = fmt.Sprintf("确认中 %d/%d 根K线（评分 %.3f 已达阈值 %.2f）", s.confirmCount, s.confirmBars, composite, s.buyThreshold)
+			}
 		}
 	}
 
@@ -439,55 +555,209 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 	if hasPosition {
 		s.barsSinceEntry++
 
-		// Track high water mark
 		if closePrice > s.highWaterMark {
 			s.highWaterMark = closePrice
 		}
 
-		// Minimum hold period: don't sell too early (prevents signal flip-flop)
 		if s.minHoldBars > 0 && s.barsSinceEntry < s.minHoldBars {
-			return sig, nil
-		}
-
-		// Sell condition 1: ATR trailing stop (primary exit mechanism)
-		if atr > 0 && s.highWaterMark > 0 {
-			mult := s.atrStopMult
-
-			// Profit-based tightening (existing logic, applied on top)
-			if s.entryPrice > 0 {
-				profitPct := (s.highWaterMark - s.entryPrice) / s.entryPrice * 100
-				if profitPct > 30 {
-					mult *= 0.65 // aggressive tighten at 30%+ profit
-				} else if profitPct > 15 {
-					mult *= 0.8 // moderate tighten at 15%+
+			holdReason = fmt.Sprintf("最短持仓期中 %d/%d 根K线", s.barsSinceEntry, s.minHoldBars)
+		} else {
+			// Sell condition 1: ATR trailing stop
+			if atr > 0 && s.highWaterMark > 0 {
+				mult := s.atrStopMult
+				if s.entryPrice > 0 {
+					profitPct := (s.highWaterMark - s.entryPrice) / s.entryPrice * 100
+					if profitPct > 30 {
+						mult *= 0.65
+					} else if profitPct > 15 {
+						mult *= 0.8
+					}
+				}
+				stopPrice = s.highWaterMark - atr*mult
+				if closePrice <= stopPrice {
+					sig.Action = strategy.Sell
+					sig.Strength = 0.8
+					sig.Reason = fmt.Sprintf(
+						"ATR trailing stop: price=%.2f below stop=%.2f (high=%.2f, ATR=%.2f×%.1f)",
+						closePrice, stopPrice, s.highWaterMark, atr, mult,
+					)
 				}
 			}
 
-			stopPrice := s.highWaterMark - atr*mult
-
-			if closePrice <= stopPrice {
+			// Sell condition 2: Composite score deeply negative
+			if sig.Action != strategy.Sell && s.sellThreshold > -1.0 && composite <= s.sellThreshold {
 				sig.Action = strategy.Sell
-				sig.Strength = 0.8
+				sig.Strength = clamp(-composite, 0.1, 1.0)
 				sig.Reason = fmt.Sprintf(
-					"ATR trailing stop: price=%.2f below stop=%.2f (high=%.2f, ATR=%.2f×%.1f)",
-					closePrice, stopPrice, s.highWaterMark, atr, mult,
+					"Custom sell (score=%.2f, threshold=%.2f): %s",
+					composite, s.sellThreshold, strings.Join(scoreParts, ", "),
 				)
 			}
-		}
 
-		// Sell condition 2: Composite score deeply negative
-		// Only triggers if sell_threshold is not disabled (> -1.0)
-		if sig.Action != strategy.Sell && s.sellThreshold > -1.0 && composite <= s.sellThreshold {
-			sig.Action = strategy.Sell
-			sig.Strength = clamp(-composite, 0.1, 1.0)
-			sig.Reason = fmt.Sprintf(
-				"Custom sell (score=%.2f, threshold=%.2f): %s",
-				composite, s.sellThreshold, strings.Join(scoreParts, ", "),
-			)
+			if sig.Action == strategy.Hold {
+				holdReason = fmt.Sprintf("持仓中 %d 根K线，止损价=%.2f（当前=%.2f），评分=%.3f 未触发卖出阈值 %.2f",
+					s.barsSinceEntry, stopPrice, closePrice, composite, s.sellThreshold)
+			}
 		}
 	}
 
+	// --- SHORT LOGIC (independent of long, evaluated when long action is Hold) ---
+	if s.shortEnabled && sig.Action == strategy.Hold {
+		sig = s.evaluateShort(sig, composite, scoreParts, closePrice, atr, trendBullish, htfBullish)
+	}
+
+	// --- Save diagnostics ---
+	s.lastDiag = &Diagnostics{
+		Timestamp:      snap.Timestamp.Format("2006-01-02T15:04:05Z07:00"),
+		Symbol:         snap.Symbol,
+		Action:         sig.Action.String(),
+		CompositeScore: composite,
+		ModuleScores:   moduleScores,
+		ModuleWeights:  moduleWeights,
+		BuyThreshold:   s.buyThreshold,
+		SellThreshold:  s.sellThreshold,
+		HasPosition:    hasPosition,
+		EntryPrice:     s.entryPrice,
+		HighWaterMark:  s.highWaterMark,
+		BarsSinceEntry: s.barsSinceEntry,
+		ConfirmCount:   s.confirmCount,
+		ConfirmBars:    s.confirmBars,
+		CooldownCount:  s.cooldownCount,
+		CooldownBars:   s.cooldownBars,
+		MinHoldBars:    s.minHoldBars,
+		TrendFilterOn:  s.trendFilterEnabled,
+		TrendBullish:   trendBullish,
+		TrendEMADist:   trendDist,
+		HTFEnabled:     s.htfEnabled,
+		HTFBullish:     htfBullish,
+		HTFBlocked:     htfBlocked,
+		HTFEMADist:     htfDist,
+		ATRStopMult:    s.atrStopMult,
+		ATRValue:       atr,
+		StopPrice:      stopPrice,
+		ClosePrice:     closePrice,
+		HoldReason:     holdReason,
+		Reason:         sig.Reason,
+	}
+
 	return sig, nil
+}
+
+// evaluateShort handles virtual short position management and signal generation.
+// Short entry: composite deeply negative + bearish trend confirmation.
+// Short exit: composite turns positive OR ATR trailing stop (inverted).
+func (s *CustomWeightedStrategy) evaluateShort(sig *strategy.Signal, composite float64, scoreParts []string, closePrice, atr float64, trendBullish, htfBullish bool) *strategy.Signal {
+	if s.inShortPosition {
+		s.shortBarsSinceEntry++
+
+		// Track low water mark (lowest price since entry)
+		if closePrice < s.shortLowWaterMark || s.shortLowWaterMark == 0 {
+			s.shortLowWaterMark = closePrice
+		}
+
+		// Min hold period
+		if s.shortMinHoldBars > 0 && s.shortBarsSinceEntry < s.shortMinHoldBars {
+			return sig
+		}
+
+		// Cover condition 1: ATR trailing stop (inverted — price rises above low + ATR*mult)
+		if atr > 0 && s.shortLowWaterMark > 0 && s.shortATRStopMult > 0 {
+			mult := s.shortATRStopMult
+
+			// Profit-based tightening for shorts
+			if s.shortEntryPrice > 0 {
+				profitPct := (s.shortEntryPrice - s.shortLowWaterMark) / s.shortEntryPrice * 100
+				if profitPct > 30 {
+					mult *= 0.65
+				} else if profitPct > 15 {
+					mult *= 0.8
+				}
+			}
+
+			stopPrice := s.shortLowWaterMark + atr*mult
+			if closePrice >= stopPrice {
+				sig.Action = strategy.Cover
+				sig.Strength = 0.8
+				sig.Reason = fmt.Sprintf(
+					"Short ATR trailing stop: price=%.2f above stop=%.2f (low=%.2f, ATR=%.2f×%.1f)",
+					closePrice, stopPrice, s.shortLowWaterMark, atr, mult,
+				)
+				return sig
+			}
+		}
+
+		// Cover condition 2: composite score turns strongly positive
+		if s.coverThreshold < 1.0 && composite >= s.coverThreshold {
+			sig.Action = strategy.Cover
+			sig.Strength = clamp(composite, 0.1, 1.0)
+			sig.Reason = fmt.Sprintf(
+				"Short cover (score=%.2f, threshold=%.2f): %s",
+				composite, s.coverThreshold, strings.Join(scoreParts, ", "),
+			)
+			return sig
+		}
+	} else {
+		// Not in short position — check for short entry
+
+		// Short cooldown
+		if s.shortCooldownCount > 0 {
+			s.shortCooldownCount--
+			return sig
+		}
+
+		// Trend filter: only short when trend is BEARISH (price below EMA)
+		if s.trendFilterEnabled && trendBullish {
+			s.shortConfirmCount = 0
+			return sig
+		}
+
+		// HTF filter: only short when higher TF is BEARISH
+		if s.htfEnabled && htfBullish {
+			s.shortConfirmCount = 0
+			return sig
+		}
+
+		// Score must be below short threshold
+		if composite <= s.shortThreshold {
+			s.shortConfirmCount++
+		} else {
+			s.shortConfirmCount = 0
+		}
+
+		if s.shortConfirmCount >= s.shortConfirmBars {
+			sig.Action = strategy.Short
+			sig.Strength = clamp(-composite, 0.1, 1.0)
+			sig.Reason = fmt.Sprintf(
+				"Short entry (score=%.2f, threshold=%.2f): %s",
+				composite, s.shortThreshold, strings.Join(scoreParts, ", "),
+			)
+			s.shortConfirmCount = 0
+		}
+	}
+
+	return sig
+}
+
+// OnShortSignalProcessed updates virtual short position state.
+// Called by both backtest engine and live trader when a short signal is processed.
+func (s *CustomWeightedStrategy) OnShortSignalProcessed(action strategy.Action, price float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch action {
+	case strategy.Short:
+		s.inShortPosition = true
+		s.shortEntryPrice = price
+		s.shortLowWaterMark = price
+		s.shortBarsSinceEntry = 0
+		s.shortConfirmCount = 0
+	case strategy.Cover:
+		s.inShortPosition = false
+		s.shortEntryPrice = 0
+		s.shortLowWaterMark = 0
+		s.shortBarsSinceEntry = 0
+		s.shortCooldownCount = s.shortCooldownBars
+	}
 }
 
 func (s *CustomWeightedStrategy) OnTradeExecuted(trade *exchange.Trade) {
