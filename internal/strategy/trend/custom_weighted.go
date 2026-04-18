@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jayce/btc-trader/internal/exchange"
 	"github.com/jayce/btc-trader/internal/strategy"
@@ -60,6 +61,7 @@ type CustomWeightedStrategy struct {
 	highWaterMark  float64
 	entryPrice     float64
 	barsSinceEntry int
+	klineInterval  string // "1m", "1h" 等,用于重启恢复 barsSinceEntry
 
 	// --- Short signal parameters (alert-only, independent of long) ---
 	shortEnabled      bool
@@ -69,6 +71,17 @@ type CustomWeightedStrategy struct {
 	shortMinHoldBars  int
 	shortATRStopMult  float64
 	shortCooldownBars int
+
+	// Short optimization parameters
+	shortATRStopActivatePct float64 // ATR止损激活门槛: 浮盈达到此百分比才启用ATR trailing stop (0=始终启用)
+	shortMinScoreAbs        float64 // 最小信号绝对值: |composite| 必须 >= 此值才开空 (0=不过滤)
+	shortATRVolatilityMin   float64 // 最小波动率: ATR/price百分比 >= 此值才开空 (0=不过滤)
+
+	// ADX trend strength filter for shorts
+	shortADXEnabled  bool    // 是否启用ADX过滤
+	shortADXPeriod   int     // ADX周期 (默认14)
+	shortADXMin      float64 // ADX最小值, >此值才开空 (默认20, 表示有趋势)
+	shortADXDIFilter bool    // 是否要求 -DI > +DI (空头趋势确认)
 
 	// Short runtime state (virtual position for signal tracking)
 	shortConfirmCount   int
@@ -142,12 +155,21 @@ func NewCustomWeightedStrategy() *CustomWeightedStrategy {
 		atrPeriod:          14,
 		// Short defaults
 		shortEnabled:      false,
-		shortThreshold:    -0.25,
+		shortThreshold:    -0.35, // stricter default; replaces need for shortMinScoreAbs filter
 		coverThreshold:    0.15,
-		shortConfirmBars:  1,
-		shortMinHoldBars:  12,
-		shortATRStopMult:  3.0,
-		shortCooldownBars: 4,
+		shortConfirmBars:  2,
+		shortMinHoldBars:  8,
+		shortATRStopMult:  2.5,
+		shortCooldownBars: 6,
+		// Short optimization defaults
+		shortATRStopActivatePct: 3.0, // activate trailing stop only after 3% profit
+		shortMinScoreAbs:        0,   // 0 = no filter
+		shortATRVolatilityMin:   0,   // 0 = no filter
+		// ADX defaults
+		shortADXEnabled:  false,
+		shortADXPeriod:   14,
+		shortADXMin:      20,
+		shortADXDIFilter: true,
 	}
 }
 
@@ -251,6 +273,11 @@ func (s *CustomWeightedStrategy) init(cfg map[string]interface{}) error {
 	if v, ok := cfg["min_hold_bars"]; ok {
 		s.minHoldBars = toInt(v)
 	}
+	if v, ok := cfg["interval"]; ok {
+		if s2, ok := v.(string); ok && s2 != "" {
+			s.klineInterval = s2
+		}
+	}
 	if v, ok := cfg["trend_filter"]; ok {
 		s.trendFilterEnabled = toBool(v)
 	}
@@ -292,6 +319,27 @@ func (s *CustomWeightedStrategy) init(cfg map[string]interface{}) error {
 	}
 	if v, ok := cfg["short_cooldown_bars"]; ok {
 		s.shortCooldownBars = toInt(v)
+	}
+	if v, ok := cfg["short_atr_stop_activate_pct"]; ok {
+		s.shortATRStopActivatePct = toFloat(v)
+	}
+	if v, ok := cfg["short_min_score_abs"]; ok {
+		s.shortMinScoreAbs = toFloat(v)
+	}
+	if v, ok := cfg["short_atr_volatility_min"]; ok {
+		s.shortATRVolatilityMin = toFloat(v)
+	}
+	if v, ok := cfg["short_adx_enabled"]; ok {
+		s.shortADXEnabled = toBool(v)
+	}
+	if v, ok := cfg["short_adx_period"]; ok {
+		s.shortADXPeriod = toInt(v)
+	}
+	if v, ok := cfg["short_adx_min"]; ok {
+		s.shortADXMin = toFloat(v)
+	}
+	if v, ok := cfg["short_adx_di_filter"]; ok {
+		s.shortADXDIFilter = toBool(v)
 	}
 
 	// Parse modules from config
@@ -383,6 +431,15 @@ func (s *CustomWeightedStrategy) RequiredIndicators() []strategy.IndicatorRequir
 		seen[emaKey] = struct{}{}
 		result = append(result, strategy.IndicatorRequirement{
 			Name: "EMA", Params: map[string]int{"period": s.trendPeriod},
+		})
+	}
+
+	// Need ADX for short trend strength filter
+	if s.shortADXEnabled && s.shortADXPeriod > 0 {
+		adxKey := fmt.Sprintf("ADX_%d", s.shortADXPeriod)
+		seen[adxKey] = struct{}{}
+		result = append(result, strategy.IndicatorRequirement{
+			Name: "ADX", Params: map[string]int{"period": s.shortADXPeriod},
 		})
 	}
 
@@ -482,8 +539,11 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 
 	hasPosition := snap.Position != nil && snap.Position.Quantity > 0
 	closePrice := 0.0
+	klineHigh := 0.0
 	if len(snap.Klines) > 0 {
-		closePrice = snap.Klines[len(snap.Klines)-1].Close
+		lastK := snap.Klines[len(snap.Klines)-1]
+		closePrice = lastK.Close
+		klineHigh = lastK.High
 	}
 	atr := snap.Indicators.ATR[s.atrPeriod]
 
@@ -553,35 +613,48 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 
 	// --- SELL LOGIC ---
 	if hasPosition {
+		// 恢复 entryPrice：程序重启后策略内部状态丢失,
+		// 但 snap.Position.AvgEntryPrice 从仓位管理器恢复了。
+		if s.entryPrice <= 0 && snap.Position.AvgEntryPrice > 0 {
+			s.entryPrice = snap.Position.AvgEntryPrice
+		}
+		// 如果 highWaterMark 也未初始化，用 entryPrice 兜底
+		if s.highWaterMark <= 0 && s.entryPrice > 0 {
+			s.highWaterMark = s.entryPrice
+		}
+
 		s.barsSinceEntry++
 
-		if closePrice > s.highWaterMark {
-			s.highWaterMark = closePrice
+		// 用K线最高价追踪(而非收盘价),确保捕捉到盘中最高点
+		if klineHigh > s.highWaterMark {
+			s.highWaterMark = klineHigh
+		}
+
+		// 始终计算止损价（用于前端展示），不管是否在最短持仓期内
+		if atr > 0 && s.highWaterMark > 0 {
+			mult := s.atrStopMult
+			if s.entryPrice > 0 {
+				profitPct := (s.highWaterMark - s.entryPrice) / s.entryPrice * 100
+				if profitPct > 30 {
+					mult *= 0.65
+				} else if profitPct > 15 {
+					mult *= 0.8
+				}
+			}
+			stopPrice = s.highWaterMark - atr*mult
 		}
 
 		if s.minHoldBars > 0 && s.barsSinceEntry < s.minHoldBars {
-			holdReason = fmt.Sprintf("最短持仓期中 %d/%d 根K线", s.barsSinceEntry, s.minHoldBars)
+			holdReason = fmt.Sprintf("最短持仓期中 %d/%d 根K线（止损价=%.2f）", s.barsSinceEntry, s.minHoldBars, stopPrice)
 		} else {
 			// Sell condition 1: ATR trailing stop
-			if atr > 0 && s.highWaterMark > 0 {
-				mult := s.atrStopMult
-				if s.entryPrice > 0 {
-					profitPct := (s.highWaterMark - s.entryPrice) / s.entryPrice * 100
-					if profitPct > 30 {
-						mult *= 0.65
-					} else if profitPct > 15 {
-						mult *= 0.8
-					}
-				}
-				stopPrice = s.highWaterMark - atr*mult
-				if closePrice <= stopPrice {
-					sig.Action = strategy.Sell
-					sig.Strength = 0.8
-					sig.Reason = fmt.Sprintf(
-						"ATR trailing stop: price=%.2f below stop=%.2f (high=%.2f, ATR=%.2f×%.1f)",
-						closePrice, stopPrice, s.highWaterMark, atr, mult,
-					)
-				}
+			if stopPrice > 0 && closePrice <= stopPrice {
+				sig.Action = strategy.Sell
+				sig.Strength = 0.8
+				sig.Reason = fmt.Sprintf(
+					"ATR trailing stop: price=%.2f below stop=%.2f (high=%.2f, ATR=%.2f×%.1f)",
+					closePrice, stopPrice, s.highWaterMark, atr, s.atrStopMult,
+				)
 			}
 
 			// Sell condition 2: Composite score deeply negative
@@ -603,7 +676,7 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 
 	// --- SHORT LOGIC (independent of long, evaluated when long action is Hold) ---
 	if s.shortEnabled && sig.Action == strategy.Hold {
-		sig = s.evaluateShort(sig, composite, scoreParts, closePrice, atr, trendBullish, htfBullish)
+		sig = s.evaluateShort(sig, composite, scoreParts, closePrice, atr, trendBullish, htfBullish, snap.Indicators.ADX)
 	}
 
 	// --- Save diagnostics ---
@@ -646,7 +719,7 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 // evaluateShort handles virtual short position management and signal generation.
 // Short entry: composite deeply negative + bearish trend confirmation.
 // Short exit: composite turns positive OR ATR trailing stop (inverted).
-func (s *CustomWeightedStrategy) evaluateShort(sig *strategy.Signal, composite float64, scoreParts []string, closePrice, atr float64, trendBullish, htfBullish bool) *strategy.Signal {
+func (s *CustomWeightedStrategy) evaluateShort(sig *strategy.Signal, composite float64, scoreParts []string, closePrice, atr float64, trendBullish, htfBullish bool, adx strategy.ADXValue) *strategy.Signal {
 	if s.inShortPosition {
 		s.shortBarsSinceEntry++
 
@@ -661,7 +734,14 @@ func (s *CustomWeightedStrategy) evaluateShort(sig *strategy.Signal, composite f
 		}
 
 		// Cover condition 1: ATR trailing stop (inverted — price rises above low + ATR*mult)
-		if atr > 0 && s.shortLowWaterMark > 0 && s.shortATRStopMult > 0 {
+		// Optimization: only activate ATR stop after position has reached minimum profit
+		atrStopActive := true
+		if s.shortATRStopActivatePct > 0 && s.shortEntryPrice > 0 {
+			currentProfitPct := (s.shortEntryPrice - s.shortLowWaterMark) / s.shortEntryPrice * 100
+			atrStopActive = currentProfitPct >= s.shortATRStopActivatePct
+		}
+
+		if atrStopActive && atr > 0 && s.shortLowWaterMark > 0 && s.shortATRStopMult > 0 {
 			mult := s.shortATRStopMult
 
 			// Profit-based tightening for shorts
@@ -717,8 +797,36 @@ func (s *CustomWeightedStrategy) evaluateShort(sig *strategy.Signal, composite f
 			return sig
 		}
 
+		// ADX trend strength filter: only short when there's a confirmed downtrend
+		if s.shortADXEnabled && adx.Period > 0 {
+			// ADX too low = no trend (sideways market) → don't short
+			if adx.ADX < s.shortADXMin {
+				s.shortConfirmCount = 0
+				return sig
+			}
+			// DI filter: only short when -DI > +DI (bearish directional movement)
+			if s.shortADXDIFilter && adx.MinusDI <= adx.PlusDI {
+				s.shortConfirmCount = 0
+				return sig
+			}
+		}
+
+		// Volatility filter: ATR/price must exceed minimum (skip low-volatility/ranging markets)
+		if s.shortATRVolatilityMin > 0 && closePrice > 0 && atr > 0 {
+			atrPct := atr / closePrice * 100
+			if atrPct < s.shortATRVolatilityMin {
+				s.shortConfirmCount = 0
+				return sig
+			}
+		}
+
 		// Score must be below short threshold
 		if composite <= s.shortThreshold {
+			// Signal strength filter: |composite| must be large enough
+			if s.shortMinScoreAbs > 0 && (-composite) < s.shortMinScoreAbs {
+				// Score crossed threshold but too weak — don't count
+				return sig
+			}
 			s.shortConfirmCount++
 		} else {
 			s.shortConfirmCount = 0
@@ -761,16 +869,64 @@ func (s *CustomWeightedStrategy) OnShortSignalProcessed(action strategy.Action, 
 }
 
 func (s *CustomWeightedStrategy) OnTradeExecuted(trade *exchange.Trade) {
+	// Lock (write) — runs on the order manager goroutine, racing with Evaluate
+	// which holds RLock on the same mutex.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if trade.Side == exchange.OrderSideBuy {
 		s.entryPrice = trade.Price
 		s.highWaterMark = trade.Price
-		s.barsSinceEntry = 0
 		s.confirmCount = 0
+		// 如果 trade.Timestamp 不是当前时间(重启恢复场景),根据时间差估算已过的 bars 数。
+		// 正常下单时 Timestamp ≈ now, elapsed ≈ 0, barsSinceEntry = 0。
+		// 重启恢复时 Timestamp = 真实入场时间, elapsed = 已过时长, 恢复正确的 bars。
+		elapsed := time.Since(trade.Timestamp)
+		if elapsed > 2*time.Minute && s.barDuration() > 0 {
+			s.barsSinceEntry = int(elapsed / s.barDuration())
+		} else {
+			s.barsSinceEntry = 0
+		}
 	} else {
 		s.entryPrice = 0
 		s.highWaterMark = 0
 		s.barsSinceEntry = 0
 		s.cooldownCount = s.cooldownBars // start cooldown
+	}
+}
+
+// SetHighWaterMark overrides the tracked highest price since entry.
+// Used on startup to recover the real high from DB klines, since
+// OnTradeExecuted only sets highWaterMark = entryPrice.
+func (s *CustomWeightedStrategy) SetHighWaterMark(price float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if price > s.highWaterMark {
+		s.highWaterMark = price
+	}
+}
+
+// barDuration returns the duration of one kline bar based on klineInterval.
+func (s *CustomWeightedStrategy) barDuration() time.Duration {
+	switch s.klineInterval {
+	case "1m":
+		return time.Minute
+	case "3m":
+		return 3 * time.Minute
+	case "5m":
+		return 5 * time.Minute
+	case "15m":
+		return 15 * time.Minute
+	case "30m":
+		return 30 * time.Minute
+	case "1h":
+		return time.Hour
+	case "4h":
+		return 4 * time.Hour
+	case "1d":
+		return 24 * time.Hour
+	default:
+		return 0
 	}
 }
 

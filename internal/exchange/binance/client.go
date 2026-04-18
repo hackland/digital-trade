@@ -134,10 +134,16 @@ func (c *Client) GetTicker(ctx context.Context, symbol string) (*exchange.Ticker
 	}
 
 	p := prices[0]
+	bid := parseFloat(p.BidPrice)
+	ask := parseFloat(p.AskPrice)
+	// BookTicker 接口不返回 last trade price; 用买卖中间价代替,
+	// 否则任何依赖 ticker.LastPrice 的代码(例如 position.SyncFromAccount
+	// 的 dust 过滤)拿到的永远是 0,会把真实持仓误判为 dust。
 	return &exchange.Ticker{
-		Symbol:   p.Symbol,
-		BidPrice: parseFloat(p.BidPrice),
-		AskPrice: parseFloat(p.AskPrice),
+		Symbol:    p.Symbol,
+		BidPrice:  bid,
+		AskPrice:  ask,
+		LastPrice: (bid + ask) / 2,
 	}, nil
 }
 

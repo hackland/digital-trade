@@ -107,6 +107,12 @@ func (ic *IndicatorComputer) ComputeAll(
 		case "ForceIndex":
 			period := req.Params["period"]
 			set.ForceIndex[period] = ic.ComputeForceIndex(closes, volumes, period)
+		case "ADX":
+			period := req.Params["period"]
+			if period == 0 {
+				period = 14
+			}
+			set.ADX = ic.ComputeADX(highs, lows, closes, period)
 		}
 	}
 
@@ -525,6 +531,109 @@ func (ic *IndicatorComputer) ComputeForceIndex(closes, volumes []float64, period
 
 	// EMA smooth the raw force index
 	return ic.ComputeEMA(raw, period)
+}
+
+// --- ADX (Average Directional Index) ---
+
+// ComputeADX calculates ADX, +DI, and -DI.
+// ADX measures trend strength (0-100). >25 = trending, <20 = ranging.
+// +DI > -DI = bullish trend, -DI > +DI = bearish trend.
+func (ic *IndicatorComputer) ComputeADX(highs, lows, closes []float64, period int) strategy.ADXValue {
+	n := len(closes)
+	if n < period+1 || period < 2 {
+		return strategy.ADXValue{}
+	}
+
+	// Step 1: Calculate True Range, +DM, -DM for each bar
+	tr := make([]float64, n)
+	plusDM := make([]float64, n)
+	minusDM := make([]float64, n)
+
+	for i := 1; i < n; i++ {
+		hl := highs[i] - lows[i]
+		hpc := math.Abs(highs[i] - closes[i-1])
+		lpc := math.Abs(lows[i] - closes[i-1])
+		tr[i] = math.Max(hl, math.Max(hpc, lpc))
+
+		upMove := highs[i] - highs[i-1]
+		downMove := lows[i-1] - lows[i]
+
+		if upMove > downMove && upMove > 0 {
+			plusDM[i] = upMove
+		}
+		if downMove > upMove && downMove > 0 {
+			minusDM[i] = downMove
+		}
+	}
+
+	// Step 2: Wilder's smoothing (first value = sum of first `period` values)
+	smoothTR := make([]float64, n)
+	smoothPlusDM := make([]float64, n)
+	smoothMinusDM := make([]float64, n)
+
+	// Initial sums
+	for i := 1; i <= period; i++ {
+		smoothTR[period] += tr[i]
+		smoothPlusDM[period] += plusDM[i]
+		smoothMinusDM[period] += minusDM[i]
+	}
+
+	// Wilder's smoothing for subsequent bars
+	for i := period + 1; i < n; i++ {
+		smoothTR[i] = smoothTR[i-1] - smoothTR[i-1]/float64(period) + tr[i]
+		smoothPlusDM[i] = smoothPlusDM[i-1] - smoothPlusDM[i-1]/float64(period) + plusDM[i]
+		smoothMinusDM[i] = smoothMinusDM[i-1] - smoothMinusDM[i-1]/float64(period) + minusDM[i]
+	}
+
+	// Step 3: +DI and -DI
+	plusDI := make([]float64, n)
+	minusDI := make([]float64, n)
+	dx := make([]float64, n)
+
+	for i := period; i < n; i++ {
+		if smoothTR[i] > 0 {
+			plusDI[i] = smoothPlusDM[i] / smoothTR[i] * 100
+			minusDI[i] = smoothMinusDM[i] / smoothTR[i] * 100
+		}
+		diSum := plusDI[i] + minusDI[i]
+		if diSum > 0 {
+			dx[i] = math.Abs(plusDI[i]-minusDI[i]) / diSum * 100
+		}
+	}
+
+	// Step 4: ADX = Wilder's smoothed average of DX
+	// First ADX = average of first `period` DX values (starting from index period)
+	adxStart := period * 2
+	if adxStart >= n {
+		// Not enough data for full ADX, return latest DI values with DX as approximation
+		last := n - 1
+		return strategy.ADXValue{
+			ADX:     dx[last],
+			PlusDI:  plusDI[last],
+			MinusDI: minusDI[last],
+			Period:  period,
+		}
+	}
+
+	adx := make([]float64, n)
+	sumDX := 0.0
+	for i := period; i < adxStart; i++ {
+		sumDX += dx[i]
+	}
+	adx[adxStart] = sumDX / float64(period)
+
+	// Wilder's smoothing for subsequent ADX values
+	for i := adxStart + 1; i < n; i++ {
+		adx[i] = (adx[i-1]*float64(period-1) + dx[i]) / float64(period)
+	}
+
+	last := n - 1
+	return strategy.ADXValue{
+		ADX:     adx[last],
+		PlusDI:  plusDI[last],
+		MinusDI: minusDI[last],
+		Period:  period,
+	}
 }
 
 // --- Helpers ---

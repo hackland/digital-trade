@@ -200,9 +200,9 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 				}
 			}
 		} else if sig.Action == strategy.Short && shortPositionQty == 0 {
-			// Virtual short entry: compute qty based on available cash (same sizing as long)
-			bal, _ := e.exchange.GetBalance(ctx, "USDT")
-			shortAllocUSDT := bal.Free * allocPct
+			// Virtual short entry: use initial cash for sizing (independent of long position).
+			// Short positions are virtual/signal-only, so they don't consume the simulated exchange balance.
+			shortAllocUSDT := e.cfg.InitialCash * allocPct
 			denom := currentBar.Close * (1 + e.cfg.FeeRate)
 			if denom > 0 {
 				qty := shortAllocUSDT / denom

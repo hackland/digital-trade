@@ -5,13 +5,15 @@
       "name": "backend",
       "runtimeExecutable": "make",
       "runtimeArgs": ["dashboard-dev"],
-      "port": 9090
+      "port": 9090,
+      "autoPort": false
     },
     {
       "name": "frontend",
       "runtimeExecutable": "pnpm",
       "runtimeArgs": ["dev"],
-      "port": 5199
+      "port": 5199,
+      "autoPort": false
     }
   ]
 }

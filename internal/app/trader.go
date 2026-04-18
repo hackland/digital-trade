@@ -83,6 +83,9 @@ func NewTrader(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*Tr
 		return nil, fmt.Errorf("create strategy: %w", err)
 	}
 
+	// Wire strategy into order manager so order fills sync strategy state.
+	orderMgr.SetStrategy(strat)
+
 	// Indicator computer
 	indComp := market.NewIndicatorComputer()
 
@@ -136,6 +139,70 @@ func (t *Trader) Run(ctx context.Context) error {
 				}
 				return ticker.LastPrice
 			})
+			// 修正入场价：SyncFromAccount 用的是当前市价（币安 API 不返回真实买入均价），
+			// 这里从 trades 表查最后一笔 BUY 的真实成交价来覆盖。
+			for _, sym := range t.cfg.Exchange.Symbols {
+				pos := t.position.GetPosition(sym)
+				if pos == nil || pos.Quantity <= 0 {
+					continue
+				}
+				trades, tErr := t.store.GetTrades(ctx, storage.TradeFilter{
+					Symbol: sym,
+					Limit:  5,
+				})
+				if tErr != nil {
+					continue
+				}
+				for _, tr := range trades {
+					if tr.Side == "BUY" {
+						t.position.SetEntryPrice(sym, tr.Price)
+						// 同步策略内部状态（entryPrice, highWaterMark, barsSinceEntry）
+						// 用真实入场时间恢复，OnTradeExecuted 会根据 elapsed 计算 bars
+						if t.strat != nil {
+							t.strat.OnTradeExecuted(&exchange.Trade{
+								Symbol:    sym,
+								Side:      exchange.OrderSideBuy,
+								Quantity:  pos.Quantity,
+								Price:     tr.Price,
+								Timestamp: tr.Timestamp,
+							})
+						}
+						// 从 klines 表恢复入场后的真实最高价（highWaterMark）
+						// OnTradeExecuted 只把 highWaterMark 设为 entryPrice,
+						// 入场到重启之间的历史高点会丢失。
+						klines, kErr := t.store.GetKlines(ctx, sym, t.cfg.Strategy.Config["interval"].(string),
+							tr.Timestamp, time.Now(), 2000)
+						if kErr == nil {
+							maxHigh := tr.Price
+							for _, k := range klines {
+								if k.High > maxHigh {
+									maxHigh = k.High
+								}
+							}
+							if hwSetter, ok := t.strat.(interface{ SetHighWaterMark(float64) }); ok {
+								hwSetter.SetHighWaterMark(maxHigh)
+							}
+						}
+						t.logger.Info("position state recovered from trades table",
+							zap.String("symbol", sym),
+							zap.Float64("market_price", pos.AvgEntryPrice),
+							zap.Float64("real_entry_price", tr.Price),
+							zap.Time("entry_time", tr.Timestamp),
+							zap.Int("klines_scanned", len(klines)),
+							zap.Float64("high_water_mark", func() float64 {
+								hw := tr.Price
+								for _, k := range klines {
+									if k.High > hw {
+										hw = k.High
+									}
+								}
+								return hw
+							}()),
+						)
+						break
+					}
+				}
+			}
 		}
 	} else {
 		t.logger.Warn("no API key configured, skipping account initialization")
@@ -227,6 +294,12 @@ func (t *Trader) Run(ctx context.Context) error {
 			Enabled: t.cfg.Telegram.Enabled,
 			Token:   t.cfg.Telegram.Token,
 			ChatID:  t.cfg.Telegram.ChatID,
+		}
+		// Mark messages to distinguish testnet / production-test in Telegram.
+		if t.cfg.App.Testnet {
+			tgCfg.Prefix = "🧪 *[测试]* "
+		} else {
+			tgCfg.Prefix = "🟢 *[生产测试]* "
 		}
 		tgNotifier := notify.NewTelegramNotifier(tgCfg, t.bus, t.logger.Named("telegram"))
 		g.Go(func() error {
@@ -328,6 +401,103 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 				zap.String("htf_interval", htfInterval),
 				zap.Int("htf_history", htfHistSize),
 			)
+		}
+	}
+
+	// Prefill windows from DB so strategy diagnostics are available immediately.
+	// Without this, lastDiag stays nil until enough websocket "final" klines arrive.
+	// Use a dedicated context to avoid cancellation by other goroutines in the errgroup.
+	prefillCtx, prefillCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer prefillCancel()
+	end := time.Now().UTC()
+	start := end.Add(-800 * 24 * time.Hour) // enough to cover backfill + indicators warmup
+
+	for _, symbol := range t.cfg.Exchange.Symbols {
+		primaryKey := symbol + ":" + targetInterval
+		klines, err := t.store.GetKlines(prefillCtx, symbol, targetInterval, start, end, historySize)
+		if err != nil {
+			t.logger.Warn("prefill primary klines failed",
+				zap.String("symbol", symbol),
+				zap.String("interval", targetInterval),
+				zap.Error(err),
+			)
+		} else if len(klines) > 0 {
+			windows[primaryKey] = klines
+		}
+
+		if htfInterval != "" && htfHistSize > 0 {
+			htfKey := symbol + ":" + htfInterval
+			htfKlines, err := t.store.GetKlines(prefillCtx, symbol, htfInterval, start, end, htfHistSize)
+			if err != nil {
+				t.logger.Warn("prefill htf klines failed",
+					zap.String("symbol", symbol),
+					zap.String("interval", htfInterval),
+					zap.Error(err),
+				)
+			} else if len(htfKlines) > 0 {
+				windows[htfKey] = htfKlines
+			}
+		}
+	}
+
+	// Run one initial evaluation for diagnostics (mainly for CustomWeightedStrategy).
+	// We only evaluate when primary window is warm enough.
+	for _, symbol := range t.cfg.Exchange.Symbols {
+		key := symbol + ":" + targetInterval
+		window := windows[key]
+		if len(window) < historySize {
+			continue
+		}
+
+		indicators := t.indComp.ComputeAll(window, t.strat.RequiredIndicators())
+
+		pos := t.position.GetPosition(symbol)
+		ts := window[len(window)-1].CloseTime
+		if ts.IsZero() {
+			// TimescaleDB GetKlines() currently only persists OpenTime in `time` column,
+			// CloseTime stays zero when we load from DB.
+			ts = window[len(window)-1].OpenTime
+		}
+		snapshot := &strategy.MarketSnapshot{
+			Symbol:     symbol,
+			Klines:     window,
+			Indicators: indicators,
+			Position: &strategy.PositionInfo{
+				Quantity:      pos.Quantity,
+				AvgEntryPrice: pos.AvgEntryPrice,
+				UnrealizedPnL: pos.UnrealizedPnL,
+				Side:          pos.Side,
+			},
+			Timestamp: ts,
+		}
+
+		if htfInterval != "" && htfHistSize > 0 {
+			htfKey := symbol + ":" + htfInterval
+			htfWindow := windows[htfKey]
+			if len(htfWindow) >= htfHistSize {
+				snapshot.HTFKlines = htfWindow
+				snapshot.HTFInterval = htfInterval
+				snapshot.HTFIndicators = t.indComp.ComputeAll(htfWindow, htfIndReqs)
+			}
+		}
+
+		// Some scoring modules (e.g. EMA/MACD) return 0 on the very first call to initialize their prev values.
+		// Run evaluation at least twice so diagnostics don't show composite_score=0 indefinitely right after startup.
+		var lastComposite float64
+		for i := 0; i < 3; i++ {
+			sig, err := t.strat.Evaluate(ctx, snapshot)
+			if err != nil {
+				t.logger.Debug("prefill strategy evaluate failed", zap.Error(err))
+				break
+			}
+			if sig != nil {
+				if v, ok := sig.Indicators["composite_score"]; ok {
+					lastComposite = v
+				}
+			}
+			if lastComposite != 0 {
+				break
+			}
 		}
 	}
 

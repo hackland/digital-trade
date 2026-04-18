@@ -2,8 +2,10 @@ package order
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,9 +29,25 @@ type Manager struct {
 	store    storage.Store
 	bus      *eventbus.Bus
 	logger   *zap.Logger
+	strategy strategy.Strategy // optional: notified on trade execution to sync state
 
 	mu           sync.RWMutex
 	activeOrders map[int64]*exchange.Order
+
+	// filledOrderIDs tracks orders we've already processed in onOrderFilled,
+	// to prevent double-processing when both ProcessSignal's immediate FILLED
+	// detection AND the subsequent pollActiveOrders/userDataStream callback
+	// fire for the same order. Without dedup, position is updated twice and
+	// drifts wildly from reality (observed: 1 BTC → -1 BTC → +1.28 BTC ...).
+	filledOrderIDs map[int64]time.Time
+
+	// pendingStrategy maps symbol → strategy name, populated by ProcessSignal
+	// BEFORE calling PlaceOrder. onOrderFilled looks up this map when the
+	// WS/poll path wins the dedup race (WS executionReport often arrives before
+	// REST PlaceOrder returns!) and the `strategyName` parameter is empty.
+	// Keyed by symbol (not order ID) because the order ID isn't known until
+	// REST returns, but the WS fires first.
+	pendingStrategy map[string]string
 
 	// SL/TP tracking per symbol
 	slOrders      map[string]int64   // symbol → SL order ID
@@ -62,6 +80,8 @@ func NewManager(
 		bus:              bus,
 		logger:           logger,
 		activeOrders:     make(map[int64]*exchange.Order),
+		filledOrderIDs:   make(map[int64]time.Time),
+		pendingStrategy:  make(map[string]string),
 		slOrders:         make(map[string]int64),
 		tpOrders:         make(map[string]int64),
 		trailingHighs:    make(map[string]float64),
@@ -143,6 +163,44 @@ func (m *Manager) SetRiskConfig(cfg config.RiskConfig) {
 	m.riskCfg = cfg
 }
 
+// SetStrategy injects the strategy reference so that order fills can sync
+// strategy internal state (entryPrice, highWaterMark, cooldown, etc.).
+// Without this, the strategy's OnTradeExecuted is never called and state
+// drifts from reality (e.g. cooldown never starts after a sell fill).
+func (m *Manager) SetStrategy(s strategy.Strategy) {
+	m.strategy = s
+}
+
+// errAlreadyInPosition is returned when a BUY signal arrives while we
+// already hold the asset (e.g. trader restarted with an open position).
+// Treated as a silent no-op so the strategy stops looping without sending
+// scary "quantity below minQty" Telegram alerts caused by ~$0 USDT free.
+var errAlreadyInPosition = fmt.Errorf("already in position, skipping buy")
+
+// errDustPosition is returned when the position is below the exchange's
+// min step (1e-5 BTC) and should be treated as already flat.  ProcessSignal
+// will swallow this error silently and zero out the local position so the
+// strategy stops looping SELL forever.
+var errDustPosition = fmt.Errorf("position is dust (below min step), treating as flat")
+
+// alertOrderFailure publishes a RiskAlert event so Telegram notifies the user
+// when a signal cannot be executed (build error, insufficient balance, retries
+// exhausted, etc). Without this, ProcessSignal failures are silent in logs only.
+func (m *Manager) alertOrderFailure(sig *strategy.Signal, stage string, err error) {
+	if m.bus == nil {
+		return
+	}
+	m.bus.Publish(eventbus.Event{
+		Type:      eventbus.EventRiskAlert,
+		Timestamp: time.Now(),
+		Payload: eventbus.RiskAlertEvent{
+			Rule:    "order_failure",
+			Message: fmt.Sprintf("❌ %s %s 下单失败 (%s): %v", sig.Symbol, sig.Action.String(), stage, err),
+			Level:   "warning",
+		},
+	})
+}
+
 // ProcessSignal takes a strategy signal and executes an order if risk allows.
 func (m *Manager) ProcessSignal(ctx context.Context, sig *strategy.Signal) error {
 	if sig.Action == strategy.Hold {
@@ -157,6 +215,73 @@ func (m *Manager) ProcessSignal(ctx context.Context, sig *strategy.Signal) error
 	// Build order request from signal
 	req, err := m.buildOrderRequest(ctx, sig)
 	if err != nil {
+		// Dust position on a SELL signal — silently flatten local state and
+		// return success so the strategy stops looping. No Telegram alert.
+		// Already-in-position on a BUY signal — sync strategy state from
+		// the live position so it stops emitting BUYs every cycle, then
+		// return success silently. No Telegram alert.
+		if errors.Is(err, errAlreadyInPosition) {
+			pos := m.position.GetPosition(sig.Symbol)
+			entryPx := pos.AvgEntryPrice
+			entryTime := time.Now()
+			if entryPx <= 0 {
+				if tk, tkErr := m.exchange.GetTicker(ctx, sig.Symbol); tkErr == nil {
+					entryPx = tk.LastPrice
+				}
+			}
+			// 从 trades 表查最后一笔 BUY 的真实入场时间,
+			// 这样重启后 barsSinceEntry 能正确恢复,而不是从 0 开始。
+			if m.store != nil {
+				trades, tErr := m.store.GetTrades(ctx, storage.TradeFilter{
+					Symbol: sig.Symbol,
+					Limit:  5,
+				})
+				if tErr == nil {
+					for _, t := range trades {
+						if t.Side == "BUY" {
+							entryTime = t.Timestamp
+							if entryPx <= 0 {
+								entryPx = t.Price
+							}
+							break
+						}
+					}
+				}
+			}
+			if m.strategy != nil && entryPx > 0 {
+				m.strategy.OnTradeExecuted(&exchange.Trade{
+					Symbol:    sig.Symbol,
+					Side:      exchange.OrderSideBuy,
+					Quantity:  pos.Quantity,
+					Price:     entryPx,
+					Timestamp: entryTime,
+				})
+			}
+			m.logger.Info("buy signal ignored: already in position",
+				zap.String("symbol", sig.Symbol),
+				zap.Float64("position_qty", pos.Quantity),
+				zap.Float64("entry_price", entryPx),
+			)
+			return nil
+		}
+		if errors.Is(err, errDustPosition) {
+			m.position.ForceFlat(sig.Symbol)
+			// Also reset strategy state so it can BUY again later
+			if m.strategy != nil {
+				m.strategy.OnTradeExecuted(&exchange.Trade{
+					Symbol:    sig.Symbol,
+					Side:      exchange.OrderSideSell,
+					Quantity:  0,
+					Price:     0,
+					Timestamp: time.Now(),
+				})
+			}
+			m.logger.Info("sell signal on dust position, flattened locally",
+				zap.String("symbol", sig.Symbol),
+			)
+			return nil
+		}
+		m.alertOrderFailure(sig, "build order", err)
 		return fmt.Errorf("build order: %w", err)
 	}
 
@@ -187,6 +312,15 @@ func (m *Manager) ProcessSignal(ctx context.Context, sig *strategy.Signal) error
 		return nil
 	}
 
+	// 在 PlaceOrder 之前登记策略名。WS executionReport 经常比 REST 响应
+	// 先到(毫秒级差异),如果在 PlaceOrder 返回后才登记就来不及了。
+	// 用 symbol 做 key,因为 order ID 此时还不知道。
+	if sig.Strategy != "" {
+		m.mu.Lock()
+		m.pendingStrategy[sig.Symbol] = sig.Strategy
+		m.mu.Unlock()
+	}
+
 	// Place order with retry
 	var order *exchange.Order
 	maxRetries := 3
@@ -210,6 +344,7 @@ func (m *Manager) ProcessSignal(ctx context.Context, sig *strategy.Signal) error
 		}
 	}
 	if err != nil {
+		m.alertOrderFailure(sig, "place order", err)
 		return fmt.Errorf("place order after %d retries: %w", maxRetries, err)
 	}
 
@@ -241,12 +376,10 @@ func (m *Manager) ProcessSignal(ctx context.Context, sig *strategy.Signal) error
 		m.store.SaveSignal(ctx, sig, true)
 	}
 
-	// Publish order event
-	m.bus.Publish(eventbus.Event{
-		Type:      eventbus.EventOrderUpdate,
-		Timestamp: time.Now(),
-		Payload:   eventbus.OrderUpdateEvent{Order: *order},
-	})
+	// 注:不在这里发布 EventOrderUpdate。Binance 现货市价单 REST 响应
+	// 通常已经带 FILLED 状态,如果这里再发一次,Telegram 就会收到两条
+	// "订单 FILLED" 消息 —— 一条从这里,一条从下面 onOrderFilled line 744。
+	// 让 onOrderFilled 成为 FILLED 事件的唯一发布者。
 
 	// If market order, it's likely already filled — update position
 	if order.Status == exchange.OrderStatusFilled {
@@ -391,6 +524,19 @@ func (m *Manager) buildOrderRequest(ctx context.Context, sig *strategy.Signal) (
 	}
 
 	if sig.Action == strategy.Buy {
+		// Guard: 已经持有该 symbol → 拒绝再次买入。
+		// 触发场景: trader 重启后, position manager 从交易所同步出已有 BTC,
+		// 但 strategy 内部状态是空的, 仍会发出 BUY 信号。USDT 几乎为 0,
+		// 计算出的 quantity 必然低于 minQty, 每根 K 线触发一次 Telegram 风控告警。
+		// 此处直接返回 errAlreadyInPosition, 由 ProcessSignal 同步策略状态后静默退出。
+		existing := m.position.GetPosition(sig.Symbol)
+		// 用美元价值判断是否真正持仓,与 SyncFromAccount 的 $10 dust 阈值对齐。
+		// 避免交易所残留 dust（如 0.00004 BTC ≈ $3）误触拦截。
+		existingValue := existing.Quantity * ticker.LastPrice
+		if existingValue >= 10 {
+			return nil, errAlreadyInPosition
+		}
+
 		// 买入: 使用 alloc_pct 配置决定仓位大小
 		allocPct := m.riskCfg.AllocPct
 		if allocPct <= 0 {
@@ -401,11 +547,11 @@ func (m *Manager) buildOrderRequest(ctx context.Context, sig *strategy.Signal) (
 		}
 		allocUSDT := balance.Free * allocPct
 
-		// 预留手续费空间 (Binance 现货 0.1% taker fee)
-		// 确保下单后还有余额支付手续费
-		feeReserve := 1.0 + 0.001 // 0.1% fee
+		// Binance 现货 BUY 手续费从收到的 BTC 里扣,USDT 侧不扣费。
+		// 但市价单实际成交价可能略高于 askPrice（滑点），如果 qty × 实际价 > free
+		// 就会报 -2010 insufficient balance。预留 0.1% 缓冲防滑点。
 		if ticker.AskPrice > 0 {
-			req.Quantity = allocUSDT / (ticker.AskPrice * feeReserve)
+			req.Quantity = allocUSDT / (ticker.AskPrice * 1.001)
 		}
 
 		// 按 stepSize 截断并检查最小值
@@ -415,17 +561,61 @@ func (m *Manager) buildOrderRequest(ctx context.Context, sig *strategy.Signal) (
 		}
 		req.Quantity = adjQty
 	} else {
-		// 卖出: 使用当前持仓全部数量
+		// 卖出: 使用当前持仓数量，但绝不超过交易所可用 free 余额
+		// （Locked 部分被 SL/TP 等挂单占用，无法直接卖出，否则 Binance 报 -2010）
 		pos := m.position.GetPosition(sig.Symbol)
-		if pos.Quantity > 0 {
-			adjQty, err := m.adjustQuantity(sig.Symbol, pos.Quantity, ticker.BidPrice)
-			if err != nil {
-				return nil, fmt.Errorf("adjust sell quantity: %w", err)
-			}
-			req.Quantity = adjQty
-		} else {
-			return nil, fmt.Errorf("no position to sell for %s", sig.Symbol)
+		if pos.Quantity <= 0 {
+			return nil, errDustPosition
 		}
+		// Position 介于 0 和 1 个 stepSize 之间 → 不可卖，视为 dust。
+		if pos.Quantity < 1e-5 {
+			return nil, errDustPosition
+		}
+
+		// Extract base asset from pair (e.g. "BTCUSDT" -> "BTC")
+		baseAsset := strings.TrimSuffix(sig.Symbol, "USDT")
+		baseBal, err := m.exchange.GetBalance(ctx, baseAsset)
+		if err != nil {
+			return nil, fmt.Errorf("get base balance %s: %w", baseAsset, err)
+		}
+
+		sellQty := pos.Quantity
+		if baseBal.Free < sellQty {
+			m.logger.Warn("sell qty capped by free balance",
+				zap.String("symbol", sig.Symbol),
+				zap.Float64("position_qty", pos.Quantity),
+				zap.Float64("free_balance", baseBal.Free),
+				zap.Float64("locked", baseBal.Locked),
+			)
+			sellQty = baseBal.Free
+		}
+
+		// 在卖出之前先取消所有挂着的 SL/TP 单，把 Locked 释放成 Free，
+		// 否则市价卖出会因为 free 不够而失败。
+		if baseBal.Locked > 1e-8 {
+			m.logger.Info("cancelling existing SL/TP before market sell",
+				zap.String("symbol", sig.Symbol),
+				zap.Float64("locked", baseBal.Locked),
+			)
+			m.cancelExistingSLTP(ctx, sig.Symbol)
+			// 重新查询 free 余额（取消可能还没立即生效，给一个简单等待）
+			time.Sleep(500 * time.Millisecond)
+			if rebal, err := m.exchange.GetBalance(ctx, baseAsset); err == nil {
+				sellQty = math.Min(pos.Quantity, rebal.Free)
+			}
+		}
+
+		if sellQty < 1e-5 {
+			return nil, errDustPosition
+		}
+
+		adjQty, err := m.adjustQuantity(sig.Symbol, sellQty, ticker.BidPrice)
+		if err != nil {
+			// Most common cause here is "quantity below minQty" — the residual
+			// is dust, not a real error. Treat the same as errDustPosition.
+			return nil, errDustPosition
+		}
+		req.Quantity = adjQty
 	}
 
 	return req, nil
@@ -529,6 +719,37 @@ func (m *Manager) handleSLTPFilled(order *exchange.Order) {
 }
 
 func (m *Manager) onOrderFilled(ctx context.Context, order *exchange.Order, strategyName string) {
+	// Dedup: any given order ID may only be processed ONCE.
+	// ProcessSignal's immediate-FILLED branch and pollActiveOrders/WS callback
+	// can both fire for the same market order. Without this guard the position
+	// gets double-decremented and the entire local state diverges from Binance.
+	m.mu.Lock()
+	if _, already := m.filledOrderIDs[order.ID]; already {
+		m.mu.Unlock()
+		m.logger.Debug("onOrderFilled: skipping duplicate", zap.Int64("order_id", order.ID))
+		return
+	}
+	m.filledOrderIDs[order.ID] = time.Now()
+	// GC: drop entries older than 1h to prevent unbounded growth
+	cutoff := time.Now().Add(-1 * time.Hour)
+	for id, t := range m.filledOrderIDs {
+		if t.Before(cutoff) {
+			delete(m.filledOrderIDs, id)
+		}
+	}
+	// 兜底:strategyName 为空时从 pendingStrategy map 查。
+	// WS executionReport 经常比 REST PlaceOrder 响应先到,
+	// 导致 handleOrderUpdate 路径以 strategyName="" 进来。
+	// ProcessSignal 在 PlaceOrder 之前已按 symbol 登记了策略名。
+	if strategyName == "" {
+		if s, ok := m.pendingStrategy[order.Symbol]; ok {
+			strategyName = s
+		}
+	}
+	// 用完即删,防止 map 无限增长。
+	delete(m.pendingStrategy, order.Symbol)
+	m.mu.Unlock()
+
 	// Update position
 	trade := &exchange.Trade{
 		OrderID:   order.ID,
@@ -542,14 +763,37 @@ func (m *Manager) onOrderFilled(ctx context.Context, order *exchange.Order, stra
 		trade.Price = order.Price
 	}
 
+	// 捕获 OnTrade 前后 RealizedPnL 的差值,作为本笔 trade 的实际已实现盈亏。
+	// pos.RealizedPnL 是累计值,如果直接把累计值存进 trades 表,BUY 单会把
+	// 上一笔 SELL 的盈亏继续带出来(观测到 BUY realized_pnl = -51.63,
+	// 和上一笔 SELL 完全一样),导致下游统计重复计数。
+	prevRealized := m.position.GetPosition(order.Symbol).RealizedPnL
 	m.position.OnTrade(trade)
+	newRealized := m.position.GetPosition(order.Symbol).RealizedPnL
+	tradeRealizedPnL := newRealized - prevRealized
+
+	// Authoritative reconciliation: re-fetch real balance from the exchange
+	// and overwrite local quantity. This makes the local state self-correcting
+	// even if any double-processing or missed updates occur upstream.
+	baseAsset := strings.TrimSuffix(order.Symbol, "USDT")
+	if bal, balErr := m.exchange.GetBalance(ctx, baseAsset); balErr == nil {
+		var px float64
+		if tk, tkErr := m.exchange.GetTicker(ctx, order.Symbol); tkErr == nil {
+			px = tk.LastPrice
+		}
+		m.position.ReconcileFromAccount(order.Symbol, baseAsset, bal.Free, px)
+	} else {
+		m.logger.Warn("post-fill reconcile: get balance failed",
+			zap.String("asset", baseAsset),
+			zap.Error(balErr),
+		)
+	}
 
 	// Post-trade risk check
 	m.risk.PostTradeCheck(ctx, trade)
 
 	// Persist trade
 	if m.store != nil {
-		pos := m.position.GetPosition(order.Symbol)
 		m.store.SaveTrade(ctx, &storage.TradeRecord{
 			ExchangeID:   order.ID,
 			OrderID:      order.ID,
@@ -558,9 +802,18 @@ func (m *Manager) onOrderFilled(ctx context.Context, order *exchange.Order, stra
 			Price:        trade.Price,
 			Quantity:     trade.Quantity,
 			StrategyName: strategyName,
-			RealizedPnL:  pos.RealizedPnL,
+			RealizedPnL:  tradeRealizedPnL, // 本笔 trade 的增量,而非累计
 			Timestamp:    trade.Timestamp,
 			CreatedAt:    time.Now(),
+		})
+
+		// Update order record with fill data (market orders have price=0 at insertion)
+		m.store.UpdateOrder(ctx, &storage.OrderRecord{
+			ExchangeID: order.ID,
+			Status:     order.Status.String(),
+			FilledQty:  order.FilledQty,
+			AvgPrice:   order.AvgPrice,
+			UpdatedAt:  time.Now(),
 		})
 	}
 
@@ -590,6 +843,24 @@ func (m *Manager) onOrderFilled(ctx context.Context, order *exchange.Order, stra
 			RealizedPnL:   pos.RealizedPnL,
 		},
 	})
+
+	// Publish FILLED order update so Telegram can notify the user.
+	// The earlier publish in ProcessSignal sends NEW status which Telegram
+	// ignores; this is the canonical "trade executed" event.
+	filledOrder := *order
+	filledOrder.Status = exchange.OrderStatusFilled
+	m.bus.Publish(eventbus.Event{
+		Type:      eventbus.EventOrderUpdate,
+		Timestamp: time.Now(),
+		Payload:   eventbus.OrderUpdateEvent{Order: filledOrder},
+	})
+
+	// Sync strategy internal state (entryPrice, highWaterMark, cooldown, etc.).
+	// Without this the strategy never enters cooldown after a sell, and entryPrice
+	// stays 0 forever, breaking ATR trailing-stop tightening.
+	if m.strategy != nil {
+		m.strategy.OnTradeExecuted(trade)
+	}
 
 	m.logger.Info("order filled",
 		zap.Int64("order_id", order.ID),
@@ -777,6 +1048,11 @@ func (m *Manager) checkTrailingStop(ctx context.Context, symbol string, currentP
 
 	// Cancel existing SL/TP first
 	m.cancelExistingSLTP(ctx, symbol)
+
+	// 在 PlaceOrder 之前登记策略名,防止 WS 先到时丢失。
+	m.mu.Lock()
+	m.pendingStrategy[symbol] = "trailing_stop"
+	m.mu.Unlock()
 
 	// Place market sell
 	sellOrder, err := m.exchange.PlaceOrder(ctx, exchange.OrderRequest{

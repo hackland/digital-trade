@@ -26,10 +26,10 @@
         </template>
       </el-table-column>
       <el-table-column prop="price" label="Price">
-        <template #default="{ row }">{{ formatPrice(row.price) }}</template>
+        <template #default="{ row }">{{ formatPrice(row.avg_price || row.price) }}</template>
       </el-table-column>
       <el-table-column prop="quantity" label="Qty">
-        <template #default="{ row }">{{ formatNumber(row.quantity, 6) }}</template>
+        <template #default="{ row }">{{ formatNumber(row.filled_qty || row.quantity, 6) }}</template>
       </el-table-column>
       <el-table-column prop="strategy_name" label="Strategy" />
       <el-table-column prop="created_at" label="Time" width="160">

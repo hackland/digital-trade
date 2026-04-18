@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jayce/btc-trader/internal/eventbus"
@@ -18,6 +19,9 @@ type TelegramConfig struct {
 	Enabled bool   `mapstructure:"enabled"`
 	Token   string `mapstructure:"token"`
 	ChatID  string `mapstructure:"chat_id"`
+	// Prefix is prepended to every outgoing message. Used to mark testnet
+	// messages so they can be distinguished from production in a shared chat.
+	Prefix string `mapstructure:"-"`
 }
 
 // TelegramNotifier listens to EventBus events and sends Telegram messages.
@@ -49,6 +53,16 @@ func (n *TelegramNotifier) Run(ctx context.Context) error {
 	// Send startup message
 	n.send(ctx, "🟢 *BTC Trader 已启动*\n模式: 实时监控中")
 
+	// Guarantee a shutdown message on any return path (ctx cancel, bus close,
+	// sibling goroutine error). Uses a fresh context with a short timeout so
+	// it still fires when the parent ctx is already canceled, and won't hang
+	// indefinitely if Telegram is unreachable during shutdown.
+	defer func() {
+		sendCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		n.send(sendCtx, "🔴 *BTC Trader 已停止*")
+	}()
+
 	orderCh := n.bus.Subscribe(eventbus.EventOrderUpdate, 100)
 	signalCh := n.bus.Subscribe(eventbus.EventSignal, 100)
 	riskCh := n.bus.Subscribe(eventbus.EventRiskAlert, 100)
@@ -56,7 +70,6 @@ func (n *TelegramNotifier) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			n.send(context.Background(), "🔴 *BTC Trader 已停止*")
 			return ctx.Err()
 
 		case evt, ok := <-orderCh:
@@ -154,31 +167,61 @@ func (n *TelegramNotifier) handleRisk(ctx context.Context, evt eventbus.Event) {
 	n.send(ctx, msg)
 }
 
-// send sends a Markdown message to Telegram.
+// send sends a Markdown message to Telegram. Tries Markdown first; on 400
+// (typically caused by unescaped special chars in interpolated error strings)
+// retries with parse_mode disabled so the message still gets through.
 func (n *TelegramNotifier) send(ctx context.Context, text string) {
+	if n.cfg.Prefix != "" {
+		text = n.cfg.Prefix + text
+	}
+	if n.sendOnce(ctx, text, "Markdown") {
+		return
+	}
+	// Retry as plain text — strip the Markdown emphasis chars to keep it readable
+	plain := stripMarkdown(text)
+	n.sendOnce(ctx, plain, "")
+}
+
+// sendOnce posts the request once and returns true on HTTP 200.
+func (n *TelegramNotifier) sendOnce(ctx context.Context, text, parseMode string) bool {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", n.cfg.Token)
 
-	body, _ := json.Marshal(map[string]interface{}{
-		"chat_id":    n.cfg.ChatID,
-		"text":       text,
-		"parse_mode": "Markdown",
-	})
+	payload := map[string]interface{}{
+		"chat_id": n.cfg.ChatID,
+		"text":    text,
+	}
+	if parseMode != "" {
+		payload["parse_mode"] = parseMode
+	}
+	body, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		n.logger.Error("telegram: build request", zap.Error(err))
-		return
+		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := n.client.Do(req)
 	if err != nil {
 		n.logger.Error("telegram: send message", zap.Error(err))
-		return
+		return false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		n.logger.Warn("telegram: non-200 response", zap.Int("status", resp.StatusCode))
+		n.logger.Warn("telegram: non-200 response",
+			zap.Int("status", resp.StatusCode),
+			zap.String("parse_mode", parseMode),
+		)
+		return false
 	}
+	return true
+}
+
+// stripMarkdown removes Telegram Markdown emphasis characters so the text
+// can be sent as plain text fallback.
+func stripMarkdown(s string) string {
+	r := strings.NewReplacer("*", "", "_", "", "`", "")
+	return r.Replace(s)
 }

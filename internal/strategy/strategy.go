@@ -94,6 +94,17 @@ type IndicatorSet struct {
 
 	// KDJ (Stochastic)
 	KDJ KDJValue
+
+	// ADX (Average Directional Index)
+	ADX ADXValue
+}
+
+// ADXValue holds ADX indicator components.
+type ADXValue struct {
+	ADX     float64 // trend strength (0-100), >25 = trending
+	PlusDI  float64 // +DI (bullish directional indicator)
+	MinusDI float64 // -DI (bearish directional indicator)
+	Period  int
 }
 
 // MACDValue holds MACD indicator components.

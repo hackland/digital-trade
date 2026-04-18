@@ -105,6 +105,18 @@ func (m *Manager) OnTrade(trade *exchange.Trade) {
 		}
 	}
 
+	// Dust collapse: residual qty after a sell that's smaller than 1e-5 BTC
+	// (or whichever asset) is operationally untradeable — Binance min step
+	// for BTCUSDT is 1e-5. Treat it as flat to prevent the strategy from
+	// looping "SELL → quantity 0 → error" every K-line.
+	if pos.Quantity > 0 && pos.Quantity < 1e-5 {
+		m.logger.Info("position dust collapsed to flat",
+			zap.String("symbol", trade.Symbol),
+			zap.Float64("residual_qty", pos.Quantity),
+		)
+		pos.Quantity = 0
+	}
+
 	// Update side
 	if pos.Quantity > 0 {
 		pos.Side = "LONG"
@@ -122,6 +134,68 @@ func (m *Manager) OnTrade(trade *exchange.Trade) {
 		zap.Float64("realized_pnl", pos.RealizedPnL),
 		zap.String("side", pos.Side),
 	)
+}
+
+// ReconcileFromAccount overwrites the local position quantity for a symbol
+// with the authoritative free balance from the exchange. AvgEntryPrice and
+// RealizedPnL are preserved from local state because Binance doesn't expose
+// the original cost basis.
+//
+// This is called after every order fill so the local state never drifts from
+// the exchange even if there are double-fill events, manual interventions,
+// or missed websocket updates.
+func (m *Manager) ReconcileFromAccount(symbol, baseAsset string, freeQty, currentPrice float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	pos, ok := m.positions[symbol]
+	if !ok {
+		pos = &Position{Symbol: symbol, Side: "FLAT"}
+		m.positions[symbol] = pos
+	}
+
+	oldQty := pos.Quantity
+	pos.Quantity = freeQty
+	if currentPrice > 0 {
+		pos.CurrentPrice = currentPrice
+	}
+
+	// Dust → flat. Use 1e-5 (Binance BTCUSDT min step) instead of 1e-8 because
+	// any residual smaller than the min step is operationally unsellable.
+	if pos.Quantity < 1e-5 || (currentPrice > 0 && pos.Quantity*currentPrice < 10) {
+		pos.Quantity = 0
+		pos.AvgEntryPrice = 0
+		pos.UnrealizedPnL = 0
+		pos.Side = "FLAT"
+	} else {
+		pos.Side = "LONG"
+		if pos.AvgEntryPrice > 0 && currentPrice > 0 {
+			pos.UnrealizedPnL = (currentPrice - pos.AvgEntryPrice) * pos.Quantity
+		}
+	}
+
+	if oldQty != pos.Quantity {
+		m.logger.Info("position reconciled from account",
+			zap.String("symbol", symbol),
+			zap.Float64("old_qty", oldQty),
+			zap.Float64("new_qty", pos.Quantity),
+			zap.String("side", pos.Side),
+		)
+	}
+}
+
+// ForceFlat forces a symbol to FLAT state. Used when a sell signal arrives
+// on a dust position that can't actually be sold — we want to clear local
+// state so the strategy stops looping SELL.
+func (m *Manager) ForceFlat(symbol string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if pos, ok := m.positions[symbol]; ok {
+		pos.Quantity = 0
+		pos.AvgEntryPrice = 0
+		pos.UnrealizedPnL = 0
+		pos.Side = "FLAT"
+	}
 }
 
 // UpdatePrice updates the current price and unrealized PnL for a symbol.
@@ -179,13 +253,30 @@ func (m *Manager) SyncFromAccount(balances []exchange.Balance, symbols []string,
 		if !symbolSet[b.Asset] {
 			continue
 		}
-		totalQty := b.Free + b.Locked
+		// 只用 Free 余额作为可交易持仓。Locked 部分通常是挂单（SL/TP）占用，
+		// 把它算进持仓会导致：
+		//   1) 策略每次评估都认为已有持仓 → 永远走 SELL 分支，BUY 永远不会触发
+		//   2) 卖单尝试卖出 Free+Locked 数量 → Binance 返回 -2010 insufficient balance
+		totalQty := b.Free
 		if totalQty < 1e-8 {
 			continue
 		}
 
+		// Dust 过滤：取不到价格 或 折算后 < $10 都视为零钱，不当持仓处理。
+		// 之前的逻辑写成 `if price > 0 && totalQty*price < 10`，price=0 时
+		// 整个表达式为 false，反而把 dust 当成正常持仓同步进来 → 策略一启动
+		// 就以为有 1 BTC，导致永远走 SELL 分支。
 		symbol := b.Asset + "USDT"
 		price := getPrice(symbol)
+		if price <= 0 || totalQty*price < 10 {
+			m.logger.Info("position sync: dust balance ignored",
+				zap.String("symbol", symbol),
+				zap.Float64("qty", totalQty),
+				zap.Float64("price", price),
+				zap.Float64("value_usdt", totalQty*price),
+			)
+			continue
+		}
 
 		pos := &Position{
 			Symbol:       symbol,
@@ -205,6 +296,17 @@ func (m *Manager) SyncFromAccount(balances []exchange.Balance, symbols []string,
 			zap.Float64("qty", totalQty),
 			zap.Float64("price", price),
 		)
+	}
+}
+
+// SetEntryPrice corrects the avg entry price for a position.
+// Used on startup to replace the market-price estimate with the real entry
+// price from the trades table.
+func (m *Manager) SetEntryPrice(symbol string, price float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if pos, ok := m.positions[symbol]; ok && price > 0 {
+		pos.AvgEntryPrice = price
 	}
 }
 

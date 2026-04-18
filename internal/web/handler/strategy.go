@@ -68,12 +68,12 @@ func (h *Handler) GetIndicatorModules(c *gin.Context) {
 			{Key: "htf_period", Label: "大周期EMA", Type: "int", Default: 10, Min: 5, Max: 100, Step: 5, Group: "trend", Desc: "大周期上的EMA均线周期"},
 			// 做空参数
 			{Key: "short_enabled", Label: "启用做空信号", Type: "bool", Default: false, Min: 0, Max: 1, Step: 1, Group: "short", Desc: "开启后生成做空提醒（仅通知，不自动交易）"},
-			{Key: "short_threshold", Label: "做空阈值", Type: "float", Default: -0.25, Min: -0.8, Max: -0.05, Step: 0.05, Group: "short", Desc: "综合评分低于此值触发做空信号"},
+			{Key: "short_threshold", Label: "做空阈值", Type: "float", Default: -0.25, Min: -0.8, Max: -0.05, Step: 0.05, Group: "short", Desc: "综合评分低于此值触发做空信号，越低越严格"},
 			{Key: "cover_threshold", Label: "平空阈值", Type: "float", Default: 0.15, Min: 0.0, Max: 0.5, Step: 0.05, Group: "short", Desc: "综合评分高于此值触发平空信号"},
-			{Key: "short_confirm_bars", Label: "做空确认K线", Type: "int", Default: 1, Min: 1, Max: 5, Step: 1, Group: "short", Desc: "连续N根K线评分达标才做空"},
-			{Key: "short_min_hold_bars", Label: "做空最短持仓", Type: "int", Default: 12, Min: 0, Max: 60, Step: 1, Group: "short", Desc: "做空后至少持有N根K线"},
-			{Key: "short_atr_stop_mult", Label: "做空ATR止损", Type: "float", Default: 3.0, Min: 1.0, Max: 8.0, Step: 0.1, Group: "short", Desc: "做空追踪止损距离 = ATR × 倍数"},
-			{Key: "short_cooldown_bars", Label: "做空冷却期", Type: "int", Default: 4, Min: 0, Max: 48, Step: 1, Group: "short", Desc: "平空后等待N根K线才允许再次做空"},
+			{Key: "short_confirm_bars", Label: "做空确认K线", Type: "int", Default: 1, Min: 1, Max: 5, Step: 1, Group: "short", Desc: "连续N根K线评分达标才做空，2根可有效过滤假信号"},
+			{Key: "short_min_hold_bars", Label: "做空最短持仓", Type: "int", Default: 12, Min: 0, Max: 60, Step: 1, Group: "short", Desc: "做空后至少持有N根K线，避免过早平仓"},
+			{Key: "short_atr_stop_mult", Label: "做空ATR止损", Type: "float", Default: 2.5, Min: 1.0, Max: 8.0, Step: 0.1, Group: "short", Desc: "做空追踪止损距离 = ATR × 倍数"},
+			{Key: "short_cooldown_bars", Label: "做空冷却期", Type: "int", Default: 8, Min: 0, Max: 48, Step: 1, Group: "short", Desc: "平空后等待N根K线才允许再次做空"},
 		},
 		"signal_presets": map[string]map[string]any{
 			"conservative": {
@@ -142,7 +142,18 @@ func (h *Handler) GetStrategyDiagnostics(c *gin.Context) {
 		return
 	}
 
-	ok(c, diag)
+	// Copy to avoid mutating the strategy's internal diagnostics state.
+	result := *diag
+
+	// Override close_price with real-time ticker so the dashboard shows
+	// the current market price, not the last kline close.
+	if result.Symbol != "" {
+		if ticker, err := h.deps.Exchange.GetTicker(c.Request.Context(), result.Symbol); err == nil && ticker.LastPrice > 0 {
+			result.ClosePrice = ticker.LastPrice
+		}
+	}
+
+	ok(c, &result)
 }
 
 // DeployStrategy hot-reloads the running strategy with new configuration.

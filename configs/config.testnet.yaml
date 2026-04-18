@@ -1,0 +1,73 @@
+app:
+  name: btc-trader-testnet
+  mode: live             # 走完整下单链路
+  log_level: debug
+  testnet: true          # ⚠️ 关键：走币安测试网
+
+exchange:
+  name: binance
+  market_type: spot
+  symbols:
+    - BTCUSDT
+  kline_intervals:
+    - 1m       # ← 主时间框架改成 1m，60倍加速
+    - 1h       # 保留作为 HTF 备用
+  # ⚠️ 在 https://testnet.binance.vision/ 注册并生成测试网 API Key（不能用正式网的 key）
+  # 启动前用环境变量注入：
+  #   export BINANCE_API_KEY=xxx
+  #   export BINANCE_SECRET_KEY=xxx
+  api_key: "W15bMOsMDqQfgrMivjf8d5dixgG1w4oV7XUZsU2mMCLo0mYwAgR7Qp1z75Nqiwfd"
+  secret_key: "JZltBsZ0sG2Fm2UlxFAylVnqRab9QJqysv4DQLpCiczqolVx2I89SULOgs9oxnDc"
+
+database:
+  # 与生产共用同一个数据库（用户决定不隔离）
+  dsn: postgres://trader:trader123@localhost:5432/btc_trader?sslmode=disable
+  max_open_conns: 10
+  max_idle_conns: 5
+  conn_max_lifetime: 5m
+
+strategy:
+  name: custom_weighted
+  config:
+    interval: 1m              # 1分钟K线，每分钟评估一次
+    modules:
+      - name: ema_cross
+        weight: 0.40
+      - name: macd
+        weight: 0.40
+      - name: mfi
+        weight: 0.20
+    # 故意把阈值调到几乎必触发，目的是验证下单链路而非策略本身
+    buy_threshold: 0.20      # 任何评分都满足
+    sell_threshold: -0.30      # 任何评分都满足
+    confirm_bars: 1
+    cooldown_bars: 1          # 取消冷却
+    min_hold_bars: 3          # 最少持仓 3 根 1m K线
+    # 测试网用更紧的 trailing stop,让 SELL 在几分钟内就能观察到。
+    # 生产环境是 4.0;1.5 大致 = 1.5 * 当前 ATR(~35) = ~50 美元的回撤就触发。
+    atr_stop_mult: 1.5
+    atr_period: 14
+    trend_filter: false       # 关掉小周期 EMA 过滤
+    htf_enabled: false        # 关掉日线过滤（testnet 日线数据可能不全）
+    htf_interval: "1d"
+    htf_period: 10
+
+risk:
+  alloc_pct: 1                  # 测试时只用一半余额，方便观察
+  emergency_alert_pct: 0.08       # 阈值放宽，避免测试时频繁告警
+  peak_drawdown_alert_pct: 0.05
+
+dashboard:
+  enabled: true
+  addr: ":9090"                   # 与生产端口隔离
+
+telegram:
+  enabled: true                   # 验证通知能否正确发出
+  # 启动前用环境变量注入（建议用独立的测试 chat_id 避免和生产消息混在一起）：
+  #   export TELEGRAM_BOT_TOKEN=xxx
+  #   export TELEGRAM_CHAT_ID=xxx
+  token: "8616095010:AAGi365ycILXiLdkqTLePkarpuup0Vh5Yc0"                     # Bot Token (或环境变量 TELEGRAM_BOT_TOKEN)
+  chat_id: "8450064310"                   # Chat ID (或环境变量 TELEGRAM_CHAT_ID)
+
+snapshot:
+  interval: 1m

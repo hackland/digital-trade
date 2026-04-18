@@ -295,6 +295,15 @@ func (c *Client) userDataHandler(ch chan<- exchange.UserDataEvent) gobinance.WsU
 
 		switch event.Event {
 		case gobinance.UserDataEventTypeExecutionReport:
+			filledQty := parseFloat(event.OrderUpdate.FilledVolume)
+			// Binance executionReport "Z" = FilledQuoteVolume (累计成交 USDT),
+			// 除以 filledQty 即为平均成交价。市价单在 WS 报文中 Price=0,
+			// 如果这里不算 AvgPrice,Telegram 通知就会显示 "$0.00"。
+			filledQuote := parseFloat(event.OrderUpdate.FilledQuoteVolume)
+			var avgPrice float64
+			if filledQty > 0 && filledQuote > 0 {
+				avgPrice = filledQuote / filledQty
+			}
 			order := &exchange.Order{
 				ID:            event.OrderUpdate.Id,
 				ClientOrderID: event.OrderUpdate.ClientOrderId,
@@ -304,7 +313,8 @@ func (c *Client) userDataHandler(ch chan<- exchange.UserDataEvent) gobinance.WsU
 				Status:        convertOrderStatus(gobinance.OrderStatusType(event.OrderUpdate.Status)),
 				Price:         parseFloat(event.OrderUpdate.Price),
 				Quantity:      parseFloat(event.OrderUpdate.Volume),
-				FilledQty:     parseFloat(event.OrderUpdate.FilledVolume),
+				FilledQty:     filledQty,
+				AvgPrice:      avgPrice,
 				UpdatedAt:     msToTime(event.OrderUpdate.TransactionTime),
 			}
 			evt.Type = "orderUpdate"

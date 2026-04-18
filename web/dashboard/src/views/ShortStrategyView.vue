@@ -9,9 +9,6 @@
             <el-tag type="warning" size="small" style="margin-left: 8px">仅告警</el-tag>
           </span>
           <div style="display: flex; gap: 8px">
-            <el-button type="primary" size="small" @click="runBacktestHandler" :loading="loading">
-              Run Backtest
-            </el-button>
             <el-popconfirm
               title="确认将做空策略参数部署到实盘引擎？(仅告警，不自动交易)"
               confirm-button-text="确认部署"
@@ -39,9 +36,6 @@
             <el-option v-for="i in INTERVALS" :key="i" :label="i" :value="i" />
           </el-select>
         </el-form-item>
-        <el-form-item label="Days">
-          <el-input-number v-model="form.days" :min="30" :max="730" :step="30" style="width: 120px" />
-        </el-form-item>
         <el-form-item label="Initial Cash">
           <el-input-number v-model="form.cash" :min="100" :step="1000" style="width: 140px" />
         </el-form-item>
@@ -52,6 +46,34 @@
           <el-input-number v-model="feePct" :min="0" :max="1" :step="0.01" :precision="3" style="width: 110px" />
         </el-form-item>
       </el-form>
+
+      <div class="time-range-row">
+        <div class="quick-btns">
+          <el-button
+            v-for="preset in dayPresets"
+            :key="preset.days"
+            :type="activeDays === preset.days ? 'primary' : 'default'"
+            size="small"
+            @click="selectPreset(preset.days)"
+            class="quick-btn"
+            :style="activeDays === preset.days
+              ? 'background: #f0b90b; border-color: #f0b90b; color: #000; font-size: 12px; font-weight: 600'
+              : 'background: #252526; border-color: #444; color: #b0b0b0; font-size: 12px; font-weight: 600'"
+          >
+            {{ preset.label }}
+          </el-button>
+        </div>
+
+        <el-button
+          type="primary"
+          size="small"
+          @click="runBacktestHandler"
+          :loading="loading"
+          style="background: #f0b90b; border-color: #f0b90b; color: #000; margin-left: 16px; height: 32px; font-weight: 600"
+        >
+          Run Backtest
+        </el-button>
+      </div>
 
       <!-- Module Selection (same as BacktestView) -->
       <div class="cw-panel">
@@ -293,6 +315,23 @@ const form = reactive({
   cash: 10000,
 })
 
+const dayPresets = [
+  { label: '7D', days: 7 },
+  { label: '30D', days: 30 },
+  { label: '90D', days: 90 },
+  { label: '180D', days: 180 },
+  { label: '365D', days: 365 },
+  { label: '2Y', days: 730 },
+]
+
+// preset-only：用于渲染 active 态并驱动 days 参数
+const activeDays = ref(form.days)
+
+function selectPreset(days: number) {
+  activeDays.value = days
+  form.days = days
+}
+
 // --- Module config (same as BacktestView) ---
 const categoryOrder = ['trend', 'momentum', 'money_flow', 'volume']
 const categoryLabels: Record<string, string> = {
@@ -333,10 +372,10 @@ function resetModules() {
   moduleWeights.value = {}
   moduleParams.value = {}
 
-  // Default: same as backtest page
+  // Default: backtest-tuned weights for short strategy
   const defaultMods: Record<string, number> = {
-    'ema_cross': 40,
-    'macd': 40,
+    'ema_cross': 20,
+    'macd': 60,
     'mfi': 20,
   }
   for (const mod of allModules) {
@@ -449,6 +488,19 @@ async function deployHandler() {
   border-top: 1px solid #333;
 }
 .cw-section { margin-bottom: 12px; }
+.time-range-row {
+  display: flex;
+  align-items: center;
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px solid #333;
+}
+.quick-btns {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.quick-btn :deep(.el-button__content) { font-weight: 600; }
 .cw-category-title {
   color: #f0b90b;
   font-size: 13px;

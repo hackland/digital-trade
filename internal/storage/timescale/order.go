@@ -30,14 +30,25 @@ func (s *Store) SaveOrder(ctx context.Context, order *storage.OrderRecord) error
 }
 
 // UpdateOrder updates an existing order record.
+// Matches by exchange_id (Binance order ID) when ExchangeID is set,
+// otherwise falls back to DB primary key.
 func (s *Store) UpdateOrder(ctx context.Context, order *storage.OrderRecord) error {
 	query := `
 		UPDATE orders
 		SET status = $1, filled_qty = $2, avg_price = $3, updated_at = $4
-		WHERE id = $5
+		WHERE exchange_id = $5
 	`
+	matchID := order.ExchangeID
+	if matchID == 0 {
+		query = `
+			UPDATE orders
+			SET status = $1, filled_qty = $2, avg_price = $3, updated_at = $4
+			WHERE id = $5
+		`
+		matchID = order.ID
+	}
 	_, err := s.pool.Exec(ctx, query,
-		order.Status, order.FilledQty, order.AvgPrice, order.UpdatedAt, order.ID,
+		order.Status, order.FilledQty, order.AvgPrice, order.UpdatedAt, matchID,
 	)
 	if err != nil {
 		return fmt.Errorf("update order: %w", err)

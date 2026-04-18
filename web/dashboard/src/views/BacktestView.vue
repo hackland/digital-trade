@@ -765,6 +765,14 @@ const fallbackSignalParams: ParamSchema[] = [
   { key: 'htf_enabled', label: '大周期过滤', type: 'bool', default: true, min: 0, max: 1, step: 1, group: 'trend', desc: '开启后用更大时间周期(如4h)确认趋势方向' },
   { key: 'htf_interval', label: '大周期', type: 'string', default: '1d', min: 0, max: 0, step: 0, group: 'trend', desc: '用于趋势确认的大时间框架' },
   { key: 'htf_period', label: '大周期EMA', type: 'int', default: 10, min: 10, max: 100, step: 5, group: 'trend', desc: '大周期上的EMA均线周期' },
+  // 做空参数
+  { key: 'short_enabled', label: '启用做空信号', type: 'bool', default: false, min: 0, max: 1, step: 1, group: 'short', desc: '开启后生成做空提醒（仅通知，不自动交易）' },
+  { key: 'short_threshold', label: '做空阈值', type: 'float', default: -0.25, min: -0.8, max: -0.05, step: 0.05, group: 'short', desc: '综合评分低于此值触发做空信号，越低越严格' },
+  { key: 'cover_threshold', label: '平空阈值', type: 'float', default: 0.15, min: 0.0, max: 0.5, step: 0.05, group: 'short', desc: '综合评分高于此值触发平空信号' },
+  { key: 'short_confirm_bars', label: '做空确认K线', type: 'int', default: 1, min: 1, max: 5, step: 1, group: 'short', desc: '连续N根K线评分达标才做空，2根可有效过滤假信号' },
+  { key: 'short_min_hold_bars', label: '做空最短持仓', type: 'int', default: 12, min: 0, max: 60, step: 1, group: 'short', desc: '做空后至少持有N根K线，避免过早平仓' },
+  { key: 'short_atr_stop_mult', label: '做空ATR止损', type: 'float', default: 2.5, min: 1.0, max: 8.0, step: 0.1, group: 'short', desc: '做空追踪止损距离 = ATR × 倍数' },
+  { key: 'short_cooldown_bars', label: '做空冷却期', type: 'int', default: 8, min: 0, max: 48, step: 1, group: 'short', desc: '平空后等待N根K线才允许再次做空' },
 ]
 
 const fallbackPresets: Record<string, SignalPreset> = {
