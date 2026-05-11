@@ -19,6 +19,11 @@ import (
 	"go.uber.org/zap"
 )
 
+// PriceUpdateHandler 接收价格更新通知（由 override.Manager 实现）
+type PriceUpdateHandler interface {
+	OnPriceUpdate(symbol string, price float64)
+}
+
 // Manager handles order lifecycle: signal → risk check → place → track → update position.
 // It also manages stop-loss, take-profit, and trailing-stop orders automatically.
 type Manager struct {
@@ -30,6 +35,9 @@ type Manager struct {
 	bus      *eventbus.Bus
 	logger   *zap.Logger
 	strategy strategy.Strategy // optional: notified on trade execution to sync state
+
+	// overrideHandler 可选，收到 kline 价格更新时通知（条件触发干预）
+	overrideHandler PriceUpdateHandler
 
 	mu           sync.RWMutex
 	activeOrders map[int64]*exchange.Order
@@ -169,6 +177,209 @@ func (m *Manager) SetRiskConfig(cfg config.RiskConfig) {
 // drifts from reality (e.g. cooldown never starts after a sell fill).
 func (m *Manager) SetStrategy(s strategy.Strategy) {
 	m.strategy = s
+}
+
+// SetOverrideHandler 注入条件触发干预管理器。
+// 每次 1m kline 更新时会调用 handler.OnPriceUpdate()，检查是否满足触发条件。
+func (m *Manager) SetOverrideHandler(h PriceUpdateHandler) {
+	m.overrideHandler = h
+}
+
+// ForceClose 强制市价平仓指定 symbol 的全部持仓。
+// 用于人工干预：立即平仓或由条件触发干预自动调用。
+//
+// 设计要点：以"交易所真实余额"为准而不是本地 position：
+//   - 重启后 SyncFromAccount 用 Free 余额，BTC 锁在 SL/TP 单里时本地显示 0；
+//   - 此时若以本地 quantity 判定，会跳过平仓 → BTC 永远卡在交易所。
+//
+// 流程：先无条件撤交易所上该 symbol 全部挂单 → 等锁仓释放 → 再按 Free 余额下市价卖单。
+func (m *Manager) ForceClose(ctx context.Context, symbol, note string) error {
+	baseAsset := strings.TrimSuffix(symbol, "USDT")
+
+	// 登记策略名（WS 可能先于 REST 返回）
+	m.mu.Lock()
+	m.pendingStrategy[symbol] = "force_close"
+	m.mu.Unlock()
+
+	// 1. 拉初始余额，看是否有锁仓需要释放。
+	bal, err := m.exchange.GetBalance(ctx, baseAsset)
+	if err != nil {
+		return fmt.Errorf("force close %s: get balance: %w", symbol, err)
+	}
+	totalQty := bal.Free + bal.Locked
+	m.logger.Info("ForceClose: initial balance",
+		zap.String("symbol", symbol),
+		zap.Float64("free", bal.Free),
+		zap.Float64("locked", bal.Locked),
+		zap.Float64("total", totalQty),
+	)
+
+	// 2. 无条件撤掉交易所上该 symbol 全部挂单。
+	//    哪怕本地 position=0，只要交易所有挂单（典型场景：重启后 SL/TP 锁仓但本地 map 为空），
+	//    也必须先撤掉，否则 Free 余额永远是 0。
+	if bal.Locked > 0 {
+		if err := m.CancelAllOrders(ctx, symbol); err != nil {
+			m.logger.Warn("ForceClose: CancelAllOrders failed (continuing)",
+				zap.String("symbol", symbol), zap.Error(err))
+		}
+		m.cancelExistingSLTP(ctx, symbol) // 顺便清掉内存 map
+
+		// 3. 轮询余额直到 Locked 释放成 Free，或超时 (15s)。
+		//    Binance 取消订单是异步的；REST 返回 200 后 Locked 余额释放还有一两秒延迟。
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(500 * time.Millisecond)
+			b, e := m.exchange.GetBalance(ctx, baseAsset)
+			if e != nil {
+				m.logger.Warn("ForceClose: balance poll error", zap.Error(e))
+				continue
+			}
+			if b.Locked < 1e-8 {
+				bal = b
+				m.logger.Info("ForceClose: locked balance released",
+					zap.String("symbol", symbol),
+					zap.Float64("free", b.Free),
+				)
+				break
+			}
+			m.logger.Debug("ForceClose: still waiting for cancel",
+				zap.Float64("free", b.Free), zap.Float64("locked", b.Locked))
+		}
+		// 最终再拉一次确认
+		if final, e := m.exchange.GetBalance(ctx, baseAsset); e == nil {
+			bal = final
+		}
+	}
+
+	qty := bal.Free
+	if qty <= 0 {
+		// 交易所 Free 还是 0：要么真的无持仓，要么 cancel 没完成
+		if bal.Locked > 0 {
+			return fmt.Errorf("force close %s: 取消挂单超时，仍有 %.6f BTC 锁仓中（Free=0）。请稍后重试或到 Binance 手动撤单",
+				symbol, bal.Locked)
+		}
+		// 本地若还有残留 position，强制清零
+		if pos := m.position.GetPosition(symbol); pos != nil && pos.Quantity > 0 {
+			m.position.ForceFlat(symbol)
+			m.logger.Warn("ForceClose: exchange balance is 0, flattened local stale position",
+				zap.String("symbol", symbol), zap.Float64("local_qty", pos.Quantity))
+		} else {
+			m.logger.Info("ForceClose: nothing to close", zap.String("symbol", symbol))
+		}
+		return nil
+	}
+
+	m.logger.Warn("ForceClose: placing market sell",
+		zap.String("symbol", symbol),
+		zap.Float64("free_qty", qty),
+		zap.String("note", note),
+	)
+
+	// 关键：必须传入当前价格，否则 minNotional 校验会用 qty*0=0 判定为 dust，
+	// 导致 ForceClose 误以为是零钱直接 ForceFlat 了。
+	ticker, tErr := m.exchange.GetTicker(ctx, symbol)
+	currentPrice := 0.0
+	if tErr == nil && ticker != nil {
+		currentPrice = ticker.LastPrice
+	}
+	adjQty, err := m.adjustQuantity(symbol, qty, currentPrice)
+	if err != nil {
+		// 真的太小（low minQty/minNotional）才走这里
+		m.position.ForceFlat(symbol)
+		m.logger.Warn("ForceClose: balance is dust, flattened locally",
+			zap.String("symbol", symbol),
+			zap.Float64("free_qty", qty),
+			zap.Float64("price", currentPrice),
+			zap.Error(err))
+		return nil
+	}
+
+	// 重试机制：挂单取消有时需要短暂延迟才能释放锁仓余额
+	var order *exchange.Order
+	for attempt := 1; attempt <= 3; attempt++ {
+		order, err = m.exchange.PlaceOrder(ctx, exchange.OrderRequest{
+			Symbol:   symbol,
+			Side:     exchange.OrderSideSell,
+			Type:     exchange.OrderTypeMarket,
+			Quantity: adjQty,
+		})
+		if err == nil {
+			break
+		}
+		m.logger.Warn("ForceClose: place order failed, retrying",
+			zap.String("symbol", symbol),
+			zap.Int("attempt", attempt),
+			zap.Error(err),
+		)
+		if attempt < 3 {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("force close %s: place order (3 attempts): %w", symbol, err)
+	}
+
+	m.logger.Info("ForceClose: order placed",
+		zap.String("symbol", symbol),
+		zap.Int64("order_id", order.ID),
+		zap.String("status", order.Status.String()),
+		zap.Float64("filled_qty", order.FilledQty),
+		zap.Float64("avg_price", order.AvgPrice),
+	)
+
+	// Persist order record so UpdateOrder in onOrderFilled can find it
+	if m.store != nil {
+		if err := m.store.SaveOrder(ctx, &storage.OrderRecord{
+			ExchangeID:    order.ID,
+			ClientOrderID: order.ClientOrderID,
+			Symbol:        order.Symbol,
+			Side:          order.Side.String(),
+			Type:          order.Type.String(),
+			Status:        order.Status.String(),
+			Price:         order.Price,
+			Quantity:      order.Quantity,
+			FilledQty:     order.FilledQty,
+			AvgPrice:      order.AvgPrice,
+			StrategyName:  "force_close",
+			SignalReason:  note,
+			CreatedAt:     order.CreatedAt,
+			UpdatedAt:     order.UpdatedAt,
+		}); err != nil {
+			m.logger.Warn("ForceClose: SaveOrder failed (non-fatal)", zap.Error(err))
+		}
+	}
+
+	m.mu.Lock()
+	m.activeOrders[order.ID] = order
+	m.mu.Unlock()
+
+	if order.Status == exchange.OrderStatusFilled {
+		m.logger.Info("ForceClose: order filled immediately, calling onOrderFilled",
+			zap.String("symbol", symbol), zap.Int64("order_id", order.ID))
+		m.onOrderFilled(ctx, order, "force_close")
+		// Clean up activeOrders since handleOrderUpdate won't be called for this path
+		m.mu.Lock()
+		delete(m.activeOrders, order.ID)
+		m.mu.Unlock()
+	} else {
+		m.logger.Warn("ForceClose: order not immediately filled, waiting for WS/poll",
+			zap.String("symbol", symbol),
+			zap.Int64("order_id", order.ID),
+			zap.String("status", order.Status.String()),
+		)
+	}
+
+	m.bus.Publish(eventbus.Event{
+		Type:      eventbus.EventRiskAlert,
+		Timestamp: time.Now(),
+		Payload: eventbus.RiskAlertEvent{
+			Rule:    "force_close",
+			Message: fmt.Sprintf("🛑 %s 强制平仓 %.5f @ market，%s", symbol, adjQty, note),
+			Level:   "warning",
+		},
+	})
+
+	return nil
 }
 
 // errAlreadyInPosition is returned when a BUY signal arrives while we
@@ -420,6 +631,10 @@ func (m *Manager) Run(ctx context.Context) error {
 					m.checkTrailingStop(ctx, ke.Symbol, ke.Kline.Close)
 					m.checkEmergencyStop(ctx, ke.Symbol, ke.Kline.Close)
 					m.checkPeakDrawdownAlert(ctx, ke.Symbol, ke.Kline.Close)
+					// 条件触发干预检查
+					if m.overrideHandler != nil {
+						m.overrideHandler.OnPriceUpdate(ke.Symbol, ke.Kline.Close)
+					}
 				}
 			}
 		case <-pollTicker.C:
@@ -757,6 +972,8 @@ func (m *Manager) onOrderFilled(ctx context.Context, order *exchange.Order, stra
 		Side:      order.Side,
 		Price:     order.AvgPrice,
 		Quantity:  order.FilledQty,
+		Fee:       order.Fee,
+		FeeAsset:  order.FeeAsset,
 		Timestamp: order.UpdatedAt,
 	}
 	if trade.Price == 0 {
@@ -794,27 +1011,59 @@ func (m *Manager) onOrderFilled(ctx context.Context, order *exchange.Order, stra
 
 	// Persist trade
 	if m.store != nil {
-		m.store.SaveTrade(ctx, &storage.TradeRecord{
+		// 确保 Timestamp 不为零：market order 的 UpdatedAt 有时为零
+		tradeTime := trade.Timestamp
+		if tradeTime.IsZero() {
+			tradeTime = time.Now()
+			m.logger.Warn("trade timestamp is zero, using current time",
+				zap.Int64("order_id", order.ID),
+				zap.String("symbol", order.Symbol),
+			)
+		}
+		if err := m.store.SaveTrade(ctx, &storage.TradeRecord{
 			ExchangeID:   order.ID,
 			OrderID:      order.ID,
 			Symbol:       order.Symbol,
 			Side:         order.Side.String(),
 			Price:        trade.Price,
 			Quantity:     trade.Quantity,
+			Fee:          trade.Fee,
+			FeeAsset:     trade.FeeAsset,
 			StrategyName: strategyName,
 			RealizedPnL:  tradeRealizedPnL, // 本笔 trade 的增量,而非累计
-			Timestamp:    trade.Timestamp,
+			Timestamp:    tradeTime,
 			CreatedAt:    time.Now(),
-		})
+		}); err != nil {
+			// 存储失败会导致重启后恢复逻辑找不到正确的 BUY 记录，产生错误的 highWaterMark
+			// 必须记录错误，方便排查
+			m.logger.Error("CRITICAL: SaveTrade failed — restart recovery will be incorrect",
+				zap.Int64("order_id", order.ID),
+				zap.String("symbol", order.Symbol),
+				zap.String("side", order.Side.String()),
+				zap.Float64("price", trade.Price),
+				zap.Error(err),
+			)
+			m.bus.Publish(eventbus.Event{
+				Type:      eventbus.EventRiskAlert,
+				Timestamp: time.Now(),
+				Payload: eventbus.RiskAlertEvent{
+					Rule:    "db_save_failed",
+					Message: fmt.Sprintf("⚠️ %s %s 成交记录写入DB失败(price=%.2f)，重启后状态恢复将出错！错误: %v", order.Symbol, order.Side.String(), trade.Price, err),
+					Level:   "critical",
+				},
+			})
+		}
 
 		// Update order record with fill data (market orders have price=0 at insertion)
-		m.store.UpdateOrder(ctx, &storage.OrderRecord{
+		if err := m.store.UpdateOrder(ctx, &storage.OrderRecord{
 			ExchangeID: order.ID,
 			Status:     order.Status.String(),
 			FilledQty:  order.FilledQty,
 			AvgPrice:   order.AvgPrice,
 			UpdatedAt:  time.Now(),
-		})
+		}); err != nil {
+			m.logger.Warn("UpdateOrder failed", zap.Int64("order_id", order.ID), zap.Error(err))
+		}
 	}
 
 	// After a BUY fill, place automatic SL/TP orders

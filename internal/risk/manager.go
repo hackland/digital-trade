@@ -246,6 +246,43 @@ func (m *Manager) PauseTrade(reason string) {
 	}
 }
 
+// PauseWithDuration 暂停交易指定时长（用于条件触发干预，时长由调用方指定）。
+// 与 PauseTrade 的区别：不依赖配置里的 DrawdownCooldownMins，由外部传入时长。
+func (m *Manager) PauseWithDuration(reason string, d time.Duration) {
+	m.mu.Lock()
+	m.isPaused = true
+	m.pauseReason = reason
+	m.pauseUntil = time.Now().Add(d)
+	oc := m.orderCanceler
+	symbols := m.symbols
+	m.mu.Unlock()
+
+	m.logger.Warn("trading paused (manual override)",
+		zap.String("reason", reason),
+		zap.Duration("duration", d),
+	)
+	m.bus.Publish(eventbus.Event{
+		Type:      eventbus.EventRiskAlert,
+		Timestamp: time.Now(),
+		Payload: eventbus.RiskAlertEvent{
+			Rule:    "manual_pause",
+			Message: fmt.Sprintf("⏸ 策略已暂停 %.0fh: %s", d.Hours(), reason),
+			Level:   "warning",
+		},
+	})
+
+	// 取消挂单（只取消 SL/TP 等挂单，不平仓）
+	if oc != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		for _, sym := range symbols {
+			if err := oc.CancelAllOrders(ctx, sym); err != nil {
+				m.logger.Error("cancel orders on manual pause", zap.String("symbol", sym), zap.Error(err))
+			}
+		}
+	}
+}
+
 // ResumeTrade resumes trading.
 func (m *Manager) ResumeTrade() {
 	m.mu.Lock()

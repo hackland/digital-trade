@@ -3,7 +3,11 @@
     <AccountCard v-if="overview" :data="overview" />
     <el-row :gutter="16" style="margin-top: 16px">
       <el-col :span="14">
-        <PositionCard :positions="overview?.positions ?? []" />
+        <PositionCard
+          :positions="overview?.positions ?? []"
+          :risk-paused="overview?.is_trading_paused ?? false"
+          @refresh="loadAll"
+        />
       </el-col>
       <el-col :span="10">
         <RecentSignals :signals="signals" />
@@ -32,7 +36,7 @@ const overview = ref<Overview | null>(null)
 const signals = ref<SignalRecord[]>([])
 const trades = ref<TradeRecord[]>([])
 
-onMounted(async () => {
+async function loadAll() {
   try {
     overview.value = await fetchOverview()
   } catch { /* backend may not be ready */ }
@@ -44,5 +48,7 @@ onMounted(async () => {
     const tradeRes = await fetchTrades({ limit: 10 })
     trades.value = tradeRes.data as TradeRecord[]
   } catch {}
-})
+}
+
+onMounted(loadAll)
 </script>

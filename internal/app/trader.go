@@ -14,6 +14,7 @@ import (
 	"github.com/jayce/btc-trader/internal/market"
 	"github.com/jayce/btc-trader/internal/notify"
 	"github.com/jayce/btc-trader/internal/order"
+	"github.com/jayce/btc-trader/internal/override"
 	"github.com/jayce/btc-trader/internal/position"
 	"github.com/jayce/btc-trader/internal/risk"
 	"github.com/jayce/btc-trader/internal/storage"
@@ -21,6 +22,7 @@ import (
 	"github.com/jayce/btc-trader/internal/strategy"
 	"github.com/jayce/btc-trader/internal/strategy/trend"
 	"github.com/jayce/btc-trader/internal/web"
+	"github.com/jayce/btc-trader/internal/web/alert"
 	"github.com/jayce/btc-trader/internal/web/handler"
 	"github.com/jayce/btc-trader/internal/web/ws"
 	"go.uber.org/zap"
@@ -36,6 +38,7 @@ type Trader struct {
 	position *position.Manager
 	risk     *risk.Manager
 	order    *order.Manager
+	override *override.Manager
 	strat    strategy.Strategy
 	indComp  *market.IndicatorComputer
 }
@@ -86,6 +89,10 @@ func NewTrader(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*Tr
 	// Wire strategy into order manager so order fills sync strategy state.
 	orderMgr.SetStrategy(strat)
 
+	// 条件触发干预管理器
+	overrideMgr := override.New(orderMgr, riskMgr, logger.Named("override"))
+	orderMgr.SetOverrideHandler(overrideMgr)
+
 	// Indicator computer
 	indComp := market.NewIndicatorComputer()
 
@@ -98,6 +105,7 @@ func NewTrader(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*Tr
 		position: posMgr,
 		risk:     riskMgr,
 		order:    orderMgr,
+		override: overrideMgr,
 		strat:    strat,
 		indComp:  indComp,
 	}, nil
@@ -153,8 +161,24 @@ func (t *Trader) Run(ctx context.Context) error {
 				if tErr != nil {
 					continue
 				}
+				// 从最近的 trades 里找当前这笔仓位对应的 BUY。
+				// trades 按 time DESC 排列：
+				//   - 如果先遇到 SELL 再遇到 BUY，说明那笔 BUY 已平仓，不能复用
+				//   - 常见于 BUY 因 DB 宕机而未记录的情况：表里最新的是 SELL，后面才是旧 BUY
+				// 此时强行用旧 BUY 的时间戳查 klines 会把已平仓阶段的高点带入 highWaterMark，
+				// 导致止损线错误偏高，提前触发平仓。
+				foundOpenBuy := false
 				for _, tr := range trades {
+					if tr.Side == "SELL" {
+						// 先遇到 SELL：后续的 BUY 都是已平仓的旧仓位，停止查找
+						t.logger.Warn("position recovery: most recent DB record is SELL — current BUY not in DB (DB was likely down at fill time); highWaterMark will start from entry price",
+							zap.String("symbol", sym),
+							zap.Float64("entry_price", pos.AvgEntryPrice),
+						)
+						break
+					}
 					if tr.Side == "BUY" {
+						foundOpenBuy = true
 						t.position.SetEntryPrice(sym, tr.Price)
 						// 同步策略内部状态（entryPrice, highWaterMark, barsSinceEntry）
 						// 用真实入场时间恢复，OnTradeExecuted 会根据 elapsed 计算 bars
@@ -182,24 +206,32 @@ func (t *Trader) Run(ctx context.Context) error {
 							if hwSetter, ok := t.strat.(interface{ SetHighWaterMark(float64) }); ok {
 								hwSetter.SetHighWaterMark(maxHigh)
 							}
+							t.logger.Info("position state recovered from trades table",
+								zap.String("symbol", sym),
+								zap.Float64("real_entry_price", tr.Price),
+								zap.Time("entry_time", tr.Timestamp),
+								zap.Int("klines_scanned", len(klines)),
+								zap.Float64("high_water_mark", maxHigh),
+							)
 						}
-						t.logger.Info("position state recovered from trades table",
-							zap.String("symbol", sym),
-							zap.Float64("market_price", pos.AvgEntryPrice),
-							zap.Float64("real_entry_price", tr.Price),
-							zap.Time("entry_time", tr.Timestamp),
-							zap.Int("klines_scanned", len(klines)),
-							zap.Float64("high_water_mark", func() float64 {
-								hw := tr.Price
-								for _, k := range klines {
-									if k.High > hw {
-										hw = k.High
-									}
-								}
-								return hw
-							}()),
-						)
 						break
+					}
+				}
+				if !foundOpenBuy {
+					// BUY 不在 DB（DB 宕机丢失），用当前均价兜底，highWaterMark 从入场价重新追踪。
+					// 止损线会比正常情况宽松，但不会把历史已平仓阶段的高点错误带入。
+					t.logger.Warn("position recovery: open BUY not in DB, using entry price as highWaterMark (trailing stop restarts from entry)",
+						zap.String("symbol", sym),
+						zap.Float64("entry_price", pos.AvgEntryPrice),
+					)
+					if t.strat != nil {
+						t.strat.OnTradeExecuted(&exchange.Trade{
+							Symbol:    sym,
+							Side:      exchange.OrderSideBuy,
+							Quantity:  pos.Quantity,
+							Price:     pos.AvgEntryPrice,
+							Timestamp: time.Now(),
+						})
 					}
 				}
 			}
@@ -273,6 +305,7 @@ func (t *Trader) Run(ctx context.Context) error {
 			Position: t.position,
 			Risk:     t.risk,
 			Order:    t.order,
+			Override: t.override,
 			Strategy: t.strat,
 		}
 		dashServer := web.NewServer(deps, t.logger.Named("dashboard"))
@@ -285,6 +318,15 @@ func (t *Trader) Run(ctx context.Context) error {
 		g.Go(func() error {
 			return dashServer.Run(gCtx)
 		})
+
+		// Position alert monitor: 暂时关闭（前端弹窗太频繁）
+		// 前端 AppLayout.vue 里的订阅也已注释，需要恢复时一起取消注释。
+		// posMonitor := alert.NewMonitor(deps, dashServer.Hub(), t.cfg.Exchange.Symbols, 5*time.Minute, t.logger.Named("alert"))
+		// g.Go(func() error {
+		// 	posMonitor.Run(gCtx)
+		// 	return nil
+		// })
+		_ = alert.NewMonitor // 防止 import 被 goimports 删掉
 	}
 
 	// Telegram notifications

@@ -11,6 +11,10 @@
       <el-icon><TrendCharts /></el-icon>
       <span>Market</span>
     </el-menu-item>
+    <el-menu-item index="/sentiment">
+      <el-icon><Compass /></el-icon>
+      <span>Sentiment</span>
+    </el-menu-item>
     <el-menu-item index="/orders">
       <el-icon><List /></el-icon>
       <span>Orders</span>
@@ -44,7 +48,7 @@
 
 <script setup lang="ts">
 import { useRoute } from 'vue-router'
-import { Odometer, TrendCharts, List, Tickets, Aim, DataAnalysis, Warning, Setting, Bottom } from '@element-plus/icons-vue'
+import { Odometer, TrendCharts, List, Tickets, Aim, DataAnalysis, Warning, Setting, Bottom, Compass } from '@element-plus/icons-vue'
 
 const route = useRoute()
 </script>

@@ -111,3 +111,32 @@ export interface Ticker {
   last_price: number
   volume_24h: number
 }
+
+// --- 条件触发干预 ---
+
+export type TriggerDir = 'above' | 'below'
+export type OverrideAction = 'force_close' | 'pause_strategy'
+export type OverrideStatus = 'active' | 'triggered' | 'cancelled'
+
+export interface ConditionalOverride {
+  id: string
+  symbol: string
+  trigger_price: number
+  direction: TriggerDir
+  actions: OverrideAction[]
+  pause_hours: number
+  note: string
+  status: OverrideStatus
+  created_at: string
+  triggered_at?: string
+  actual_price?: number
+}
+
+export interface CreateOverrideRequest {
+  symbol: string
+  trigger_price: number
+  direction: TriggerDir
+  actions: OverrideAction[]
+  pause_hours?: number
+  note?: string
+}

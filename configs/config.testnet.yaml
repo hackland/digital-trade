@@ -18,7 +18,6 @@ exchange:
   #   export BINANCE_SECRET_KEY=xxx
   api_key: "W15bMOsMDqQfgrMivjf8d5dixgG1w4oV7XUZsU2mMCLo0mYwAgR7Qp1z75Nqiwfd"
   secret_key: "JZltBsZ0sG2Fm2UlxFAylVnqRab9QJqysv4DQLpCiczqolVx2I89SULOgs9oxnDc"
-
 database:
   # 与生产共用同一个数据库（用户决定不隔离）
   dsn: postgres://trader:trader123@localhost:5432/btc_trader?sslmode=disable
@@ -71,3 +70,8 @@ telegram:
 
 snapshot:
   interval: 1m
+# 市场情绪数据源（外部 API）
+sentiment:
+  # CryptoQuant API key (用于巨鲸聚合指标)
+  # 获取：cryptoquant.com → 账户 → API → 创建 key
+  cryptoquant_api_key: "9AT2MG7S50eKYRLgsx2pQjbXeKlGXEBJAvNTOlDrHt75WSXHrTbjRPkmmc9yDKaztSsc3sHTLes4TP"

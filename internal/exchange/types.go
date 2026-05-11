@@ -132,8 +132,12 @@ type Order struct {
 	FilledQty     float64
 	AvgPrice      float64
 	StopPrice     float64
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// Fee 累积所有 fill 的手续费。多笔 fill 通常 commissionAsset 一致，
+	// 取最常见的那个（绝大多数情况是同一种）。
+	Fee       float64
+	FeeAsset  string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Trade represents a filled trade.

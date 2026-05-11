@@ -61,9 +61,27 @@ func NewServer(deps *handler.Deps, logger *zap.Logger) *Server {
 		api.GET("/indicator/modules", h.GetIndicatorModules)
 		api.GET("/config", h.GetConfig)
 		api.GET("/ticker/:symbol", h.GetTicker)
+		api.GET("/market/regime", h.GetMarketRegime)
+		api.GET("/market/opportunity", h.GetOpportunityAnalysis)
+
+		// 市场情绪
+		api.GET("/sentiment/funding", h.GetFundingRate)
+		api.GET("/sentiment/feargreed", h.GetFearGreed)
+		api.GET("/positions/:symbol/analysis", h.GetPositionAnalysis)
 		api.POST("/backtest", h.RunBacktest)
 		api.POST("/strategy/deploy", h.DeployStrategy)
 		api.GET("/backtest/strategies", h.GetStrategies)
+
+		// 条件触发干预
+		api.GET("/overrides", h.ListOverrides)
+		api.POST("/overrides", h.CreateOverride)
+		api.DELETE("/overrides/:id", h.CancelOverride)
+
+		// 即时操作
+		api.POST("/positions/:symbol/force-close", h.ForceClosePosition)
+		api.POST("/strategy/pause", h.PauseStrategy)
+		api.POST("/strategy/resume", h.ResumeStrategy)
+
 		api.GET("/ws", hub.HandleWebSocket)
 	}
 

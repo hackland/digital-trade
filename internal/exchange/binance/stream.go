@@ -315,7 +315,11 @@ func (c *Client) userDataHandler(ch chan<- exchange.UserDataEvent) gobinance.WsU
 				Quantity:      parseFloat(event.OrderUpdate.Volume),
 				FilledQty:     filledQty,
 				AvgPrice:      avgPrice,
-				UpdatedAt:     msToTime(event.OrderUpdate.TransactionTime),
+				// 注：WS 的 FeeCost (n) 是「单次成交手续费」。市价单通常一次成交，
+				// 多次成交则只反映最后一次。REST CreateOrderResponse.Fills 才是累加的。
+				Fee:       parseFloat(event.OrderUpdate.FeeCost),
+				FeeAsset:  event.OrderUpdate.FeeAsset,
+				UpdatedAt: msToTime(event.OrderUpdate.TransactionTime),
 			}
 			evt.Type = "orderUpdate"
 			evt.OrderUpdate = order

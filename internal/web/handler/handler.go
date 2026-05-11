@@ -5,6 +5,7 @@ import (
 	"github.com/jayce/btc-trader/internal/eventbus"
 	"github.com/jayce/btc-trader/internal/exchange"
 	"github.com/jayce/btc-trader/internal/order"
+	"github.com/jayce/btc-trader/internal/override"
 	"github.com/jayce/btc-trader/internal/position"
 	"github.com/jayce/btc-trader/internal/risk"
 	"github.com/jayce/btc-trader/internal/storage"
@@ -21,6 +22,7 @@ type Deps struct {
 	Position *position.Manager
 	Risk     *risk.Manager
 	Order    *order.Manager
+	Override *override.Manager
 	Strategy strategy.Strategy
 }
 

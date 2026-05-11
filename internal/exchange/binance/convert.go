@@ -56,6 +56,16 @@ func convertOrder(o *gobinance.CreateOrderResponse) *exchange.Order {
 		avgPrice = cumulativeQuote / filledQty
 	}
 
+	// 累加 Fills 中所有手续费（多 fill 通常 commissionAsset 一致）
+	var totalFee float64
+	var feeAsset string
+	for _, f := range o.Fills {
+		totalFee += parseFloat(f.Commission)
+		if feeAsset == "" {
+			feeAsset = f.CommissionAsset
+		}
+	}
+
 	return &exchange.Order{
 		ID:            o.OrderID,
 		ClientOrderID: o.ClientOrderID,
@@ -67,6 +77,8 @@ func convertOrder(o *gobinance.CreateOrderResponse) *exchange.Order {
 		Quantity:      parseFloat(o.OrigQuantity),
 		FilledQty:     filledQty,
 		AvgPrice:      avgPrice,
+		Fee:           totalFee,
+		FeeAsset:      feeAsset,
 		CreatedAt:     msToTime(o.TransactTime),
 		UpdatedAt:     msToTime(o.TransactTime),
 	}

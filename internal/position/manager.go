@@ -100,6 +100,12 @@ func (m *Manager) OnTrade(trade *exchange.Trade) {
 				sellQty = oldQty
 			}
 			realizedPnL := (trade.Price - pos.AvgEntryPrice) * sellQty
+			// 扣卖出手续费。Binance 现货卖出 fee 一般以 USDT 计价。
+			// 用 BNB 抵扣时 fee_asset=BNB，这里简化处理：只在 USDT 计价时直接扣，
+			// 其他币种暂不折算（避免引入价格依赖；可在后端日志/UI 上单独显示）。
+			if trade.FeeAsset == "USDT" || trade.FeeAsset == "" {
+				realizedPnL -= trade.Fee
+			}
 			pos.RealizedPnL += realizedPnL
 			pos.Quantity = newQty
 		}

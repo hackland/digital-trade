@@ -9,6 +9,7 @@ const router = createRouter({
       children: [
         { path: '', name: 'dashboard', component: () => import('@/views/DashboardView.vue') },
         { path: 'market', name: 'market', component: () => import('@/views/MarketView.vue') },
+        { path: 'sentiment', name: 'sentiment', component: () => import('@/views/SentimentView.vue') },
         { path: 'orders', name: 'orders', component: () => import('@/views/OrdersView.vue') },
         { path: 'trades', name: 'trades', component: () => import('@/views/TradesView.vue') },
         { path: 'signals', name: 'signals', component: () => import('@/views/SignalsView.vue') },
