@@ -89,6 +89,10 @@ export interface RiskStatus {
   pause_until: string
 }
 
+export interface RiskLimits {
+  max_long_entry_price: number
+}
+
 export interface Kline {
   symbol: string
   interval: string

@@ -49,11 +49,15 @@ type Manager struct {
 	dailyTradeCount int
 	peakEquity      float64
 	currentEquity   float64
+	currentPrice    float64
 	lastOrderTime   time.Time
 	isPaused        bool
 	pauseReason     string
 	pauseUntil      time.Time
 	dayStart        time.Time
+
+	// maxLongEntryPrice overrides cfg.MaxLongEntryPrice at runtime (0 = use cfg value).
+	maxLongEntryPrice float64
 
 	orderCanceler OrderCanceler
 	symbols       []string
@@ -64,11 +68,34 @@ func NewManager(cfg config.RiskConfig, bus *eventbus.Bus, logger *zap.Logger) *M
 	now := time.Now().UTC()
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	return &Manager{
-		cfg:      cfg,
-		bus:      bus,
-		logger:   logger,
-		dayStart: dayStart,
+		cfg:               cfg,
+		bus:               bus,
+		logger:            logger,
+		dayStart:          dayStart,
+		maxLongEntryPrice: cfg.MaxLongEntryPrice,
 	}
+}
+
+// UpdateCurrentPrice keeps track of the latest market price, used for pre-trade checks.
+func (m *Manager) UpdateCurrentPrice(price float64) {
+	m.mu.Lock()
+	m.currentPrice = price
+	m.mu.Unlock()
+}
+
+// SetMaxLongEntryPrice overrides the max-long-entry-price limit at runtime. 0 = disabled.
+func (m *Manager) SetMaxLongEntryPrice(price float64) {
+	m.mu.Lock()
+	m.maxLongEntryPrice = price
+	m.mu.Unlock()
+	m.logger.Info("max long entry price updated", zap.Float64("price", price))
+}
+
+// GetMaxLongEntryPrice returns the current limit (0 = disabled).
+func (m *Manager) GetMaxLongEntryPrice() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.maxLongEntryPrice
 }
 
 // SetOrderCanceler injects the order manager for emergency cancel on drawdown.
@@ -125,6 +152,20 @@ func (m *Manager) PreTradeCheck(ctx context.Context, req *exchange.OrderRequest,
 		drawdown := (m.peakEquity - m.currentEquity) / m.peakEquity
 		if drawdown > m.cfg.MaxDrawdownPct {
 			return &Decision{Allowed: false, Reason: fmt.Sprintf("max drawdown %.2f%% exceeded", drawdown*100)}, nil
+		}
+	}
+
+	// Check max long entry price: refuse BUY when current price is too high
+	if m.maxLongEntryPrice > 0 && req.Side == exchange.OrderSideBuy {
+		price := req.Price
+		if price == 0 {
+			price = m.currentPrice
+		}
+		if price > m.maxLongEntryPrice {
+			return &Decision{
+				Allowed: false,
+				Reason:  fmt.Sprintf("price %.2f above max long entry limit %.2f USDT", price, m.maxLongEntryPrice),
+			}, nil
 		}
 	}
 

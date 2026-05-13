@@ -80,6 +80,9 @@ type RiskConfig struct {
 	// Peak drawdown alert: send Telegram warning if price drops this % from HIGHEST since entry (checked every 1m)
 	// Protects unrealized profit. Alert only, no auto-sell. 0 = disabled.
 	PeakDrawdownAlertPct float64 `mapstructure:"peak_drawdown_alert_pct"`
+
+	// MaxLongEntryPrice: refuse BUY orders when current price exceeds this value (USDT). 0 = disabled.
+	MaxLongEntryPrice float64 `mapstructure:"max_long_entry_price"`
 }
 
 type DashboardConfig struct {

@@ -408,8 +408,9 @@ func (t *Trader) runKlineIngestion(ctx context.Context, symbol, interval string)
 				},
 			})
 
-			// Update position price
+			// Update position price and risk manager current price
 			t.position.UpdatePrice(symbol, kline.Close)
+			t.risk.UpdateCurrentPrice(kline.Close)
 		}
 	}
 }
