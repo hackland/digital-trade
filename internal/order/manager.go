@@ -520,6 +520,19 @@ func (m *Manager) ProcessSignal(ctx context.Context, sig *strategy.Signal) error
 		if m.store != nil {
 			m.store.SaveSignal(ctx, sig, false)
 		}
+		// 推送 Telegram 风控告警，避免用户看到"📈 做多买入"通知却以为下单成功
+		if m.bus != nil {
+			m.bus.Publish(eventbus.Event{
+				Type:      eventbus.EventRiskAlert,
+				Timestamp: time.Now(),
+				Payload: eventbus.RiskAlertEvent{
+					Rule: "signal_rejected",
+					Message: fmt.Sprintf("🛑 %s %s 信号被风控拦截：%s",
+						sig.Symbol, sig.Action.String(), decision.Reason),
+					Level: "warning",
+				},
+			})
+		}
 		return nil
 	}
 
