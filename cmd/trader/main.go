@@ -54,7 +54,7 @@ func main() {
 	if *migrateOnly {
 		logger.Info("migrations complete, exiting")
 		return
-	}
+
 
 	// Run
 	if err := trader.Run(ctx); err != nil {
