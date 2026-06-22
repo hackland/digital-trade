@@ -169,6 +169,7 @@ export interface StrategyDiagnostics {
   atr_stop_mult: number
   atr_value: number
   stop_price: number
+  hard_stop_price: number
   close_price: number
   hold_reason: string
   reason: string

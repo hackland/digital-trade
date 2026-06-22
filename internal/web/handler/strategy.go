@@ -60,6 +60,8 @@ func (h *Handler) GetIndicatorModules(c *gin.Context) {
 			{Key: "min_hold_bars", Label: "最短持仓", Type: "int", Default: 6, Min: 0, Max: 30, Step: 1, Group: "position", Desc: "买入后至少持有N根K线，避免频繁交易"},
 			// 止损
 			{Key: "atr_stop_mult", Label: "ATR止损倍数", Type: "float", Default: 3.0, Min: 1.0, Max: 6.0, Step: 0.1, Group: "stoploss", Desc: "追踪止损距离 = ATR × 倍数，越大越宽松"},
+			{Key: "atr_activate_profit_pct", Label: "ATR激活浮盈%", Type: "float", Default: 0.8, Min: 0, Max: 5.0, Step: 0.1, Group: "stoploss", Desc: "浮盈达到此百分比后才激活ATR追踪止损；0=始终激活"},
+			{Key: "hard_stop_pct", Label: "硬止损%", Type: "float", Default: 1.5, Min: 0, Max: 5.0, Step: 0.1, Group: "stoploss", Desc: "持仓锁结束后的兜底止损，亏损超过入场价×此比例即出场；0=禁用"},
 			// 趋势过滤
 			{Key: "trend_filter", Label: "EMA趋势过滤", Type: "bool", Default: false, Min: 0, Max: 1, Step: 1, Group: "trend", Desc: "开启后只在价格高于EMA均线时买入，过滤下跌趋势"},
 			{Key: "trend_period", Label: "EMA周期", Type: "int", Default: 50, Min: 20, Max: 200, Step: 5, Group: "trend", Desc: "趋势判断用的均线周期，50表示看50根K线趋势"},

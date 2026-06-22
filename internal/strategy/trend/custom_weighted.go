@@ -56,12 +56,14 @@ type CustomWeightedStrategy struct {
 	minHoldBars int
 
 	// ATR trailing stop
-	atrStopMult    float64
-	atrPeriod      int
-	highWaterMark  float64
-	entryPrice     float64
-	barsSinceEntry int
-	klineInterval  string // "1m", "1h" 等,用于重启恢复 barsSinceEntry
+	atrStopMult          float64
+	atrPeriod            int
+	hardStopPct          float64 // max loss % from entry before ATR activates (0=disabled)
+	atrActivateProfitPct float64 // ATR trailing only after this % profit (0=always active)
+	highWaterMark        float64
+	entryPrice           float64
+	barsSinceEntry       int
+	klineInterval        string // "1m", "1h" 等,用于重启恢复 barsSinceEntry
 
 	// --- Short signal parameters (alert-only, independent of long) ---
 	shortEnabled      bool
@@ -125,10 +127,11 @@ type Diagnostics struct {
 	HTFBlocked bool    `json:"htf_blocked"`
 	HTFEMADist float64 `json:"htf_ema_dist_pct"`
 	// ATR stop
-	ATRStopMult float64 `json:"atr_stop_mult"`
-	ATRValue    float64 `json:"atr_value"`
-	StopPrice   float64 `json:"stop_price"`
-	ClosePrice  float64 `json:"close_price"`
+	ATRStopMult   float64 `json:"atr_stop_mult"`
+	ATRValue      float64 `json:"atr_value"`
+	StopPrice     float64 `json:"stop_price"`
+	HardStopPrice float64 `json:"hard_stop_price"`
+	ClosePrice    float64 `json:"close_price"`
 	// Reason (human readable)
 	HoldReason string `json:"hold_reason"`
 	Reason     string `json:"reason"`
@@ -141,18 +144,20 @@ type weightedMod struct {
 
 func NewCustomWeightedStrategy() *CustomWeightedStrategy {
 	return &CustomWeightedStrategy{
-		buyThreshold:       0.15,
-		sellThreshold:      -0.50,
-		trendFilterEnabled: true,
-		trendPeriod:        50,
-		htfEnabled:         false,
-		htfInterval:        "4h",
-		htfPeriod:          20,
-		confirmBars:        1,
-		cooldownBars:       2,
-		minHoldBars:        6,
-		atrStopMult:        3.0,
-		atrPeriod:          14,
+		buyThreshold:         0.15,
+		sellThreshold:        -0.50,
+		trendFilterEnabled:   true,
+		trendPeriod:          50,
+		htfEnabled:           false,
+		htfInterval:          "4h",
+		htfPeriod:            20,
+		confirmBars:          1,
+		cooldownBars:         2,
+		minHoldBars:          6,
+		atrStopMult:          3.0,
+		atrPeriod:            14,
+		hardStopPct:          1.5,
+		atrActivateProfitPct: 0.8,
 		// Short defaults
 		shortEnabled:      false,
 		shortThreshold:    -0.35, // stricter default; replaces need for shortMinScoreAbs filter
@@ -215,19 +220,21 @@ func (s *CustomWeightedStrategy) GetConfig() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"modules":        mods,
-		"buy_threshold":  s.buyThreshold,
-		"sell_threshold": s.sellThreshold,
-		"confirm_bars":   s.confirmBars,
-		"cooldown_bars":  s.cooldownBars,
-		"min_hold_bars":  s.minHoldBars,
-		"atr_stop_mult":  s.atrStopMult,
-		"atr_period":     s.atrPeriod,
-		"trend_filter":   s.trendFilterEnabled,
-		"trend_period":   s.trendPeriod,
-		"htf_enabled":    s.htfEnabled,
-		"htf_interval":   s.htfInterval,
-		"htf_period":     s.htfPeriod,
+		"modules":                 mods,
+		"buy_threshold":           s.buyThreshold,
+		"sell_threshold":          s.sellThreshold,
+		"confirm_bars":            s.confirmBars,
+		"cooldown_bars":           s.cooldownBars,
+		"min_hold_bars":           s.minHoldBars,
+		"atr_stop_mult":           s.atrStopMult,
+		"atr_period":              s.atrPeriod,
+		"hard_stop_pct":           s.hardStopPct,
+		"atr_activate_profit_pct": s.atrActivateProfitPct,
+		"trend_filter":            s.trendFilterEnabled,
+		"trend_period":            s.trendPeriod,
+		"htf_enabled":             s.htfEnabled,
+		"htf_interval":            s.htfInterval,
+		"htf_period":              s.htfPeriod,
 		// Short params
 		"short_enabled":       s.shortEnabled,
 		"short_threshold":     s.shortThreshold,
@@ -269,6 +276,12 @@ func (s *CustomWeightedStrategy) init(cfg map[string]interface{}) error {
 	}
 	if v, ok := cfg["atr_period"]; ok {
 		s.atrPeriod = toInt(v)
+	}
+	if v, ok := cfg["hard_stop_pct"]; ok {
+		s.hardStopPct = toFloat(v)
+	}
+	if v, ok := cfg["atr_activate_profit_pct"]; ok {
+		s.atrActivateProfitPct = toFloat(v)
 	}
 	if v, ok := cfg["min_hold_bars"]; ok {
 		s.minHoldBars = toInt(v)
@@ -578,6 +591,7 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 	// holdReason tracks why no buy/sell was triggered (for diagnostics)
 	holdReason := ""
 	stopPrice := 0.0
+	hardStopPrice := 0.0
 
 	// --- BUY LOGIC ---
 	if !hasPosition {
@@ -630,7 +644,19 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 			s.highWaterMark = klineHigh
 		}
 
-		// 始终计算止损价（用于前端展示），不管是否在最短持仓期内
+		// 硬止损价（ATR 激活前的兜底，0=禁用）
+		if s.hardStopPct > 0 && s.entryPrice > 0 {
+			hardStopPrice = s.entryPrice * (1 - s.hardStopPct/100)
+		}
+
+		// 当前浮盈百分比，决定是否激活 ATR trailing
+		currentProfitPct := 0.0
+		if s.entryPrice > 0 && closePrice > 0 {
+			currentProfitPct = (closePrice - s.entryPrice) / s.entryPrice * 100
+		}
+		atrTrailingActive := s.atrActivateProfitPct == 0 || currentProfitPct >= s.atrActivateProfitPct
+
+		// 始终计算 ATR 止损价（用于前端展示），但仅在激活时触发出场
 		if atr > 0 && s.highWaterMark > 0 {
 			mult := s.atrStopMult
 			if s.entryPrice > 0 {
@@ -645,10 +671,24 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 		}
 
 		if s.minHoldBars > 0 && s.barsSinceEntry < s.minHoldBars {
-			holdReason = fmt.Sprintf("最短持仓期中 %d/%d 根K线（止损价=%.2f）", s.barsSinceEntry, s.minHoldBars, stopPrice)
+			effectiveStop := stopPrice
+			if !atrTrailingActive && hardStopPrice > 0 {
+				effectiveStop = hardStopPrice
+			}
+			holdReason = fmt.Sprintf("最短持仓期中 %d/%d 根K线（止损价=%.2f）", s.barsSinceEntry, s.minHoldBars, effectiveStop)
 		} else {
-			// Sell condition 1: ATR trailing stop
-			if stopPrice > 0 && closePrice <= stopPrice {
+			// Sell condition 1: 硬止损（持仓锁结束后的绝对兜底）
+			if hardStopPrice > 0 && closePrice <= hardStopPrice {
+				sig.Action = strategy.Sell
+				sig.Strength = 1.0
+				sig.Reason = fmt.Sprintf(
+					"Hard stop: price=%.2f below entry*%.1f%%=%.2f (entry=%.2f)",
+					closePrice, s.hardStopPct, hardStopPrice, s.entryPrice,
+				)
+			}
+
+			// Sell condition 2: ATR trailing stop（仅在激活状态下触发）
+			if sig.Action != strategy.Sell && atrTrailingActive && stopPrice > 0 && closePrice <= stopPrice {
 				sig.Action = strategy.Sell
 				sig.Strength = 0.8
 				sig.Reason = fmt.Sprintf(
@@ -657,7 +697,7 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 				)
 			}
 
-			// Sell condition 2: Composite score deeply negative
+			// Sell condition 3: Composite score deeply negative
 			if sig.Action != strategy.Sell && s.sellThreshold > -1.0 && composite <= s.sellThreshold {
 				sig.Action = strategy.Sell
 				sig.Strength = clamp(-composite, 0.1, 1.0)
@@ -668,8 +708,20 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 			}
 
 			if sig.Action == strategy.Hold {
-				holdReason = fmt.Sprintf("持仓中 %d 根K线，止损价=%.2f（当前=%.2f），评分=%.3f 未触发卖出阈值 %.2f",
-					s.barsSinceEntry, stopPrice, closePrice, composite, s.sellThreshold)
+				activeMark := ""
+				if s.atrActivateProfitPct > 0 {
+					if atrTrailingActive {
+						activeMark = fmt.Sprintf("，ATR trailing 已激活（浮盈=%.2f%%）", currentProfitPct)
+					} else {
+						activeMark = fmt.Sprintf("，等待浮盈 %.1f%% 激活ATR（当前=%.2f%%）", s.atrActivateProfitPct, currentProfitPct)
+					}
+				}
+				effectiveStop := stopPrice
+				if !atrTrailingActive && hardStopPrice > 0 {
+					effectiveStop = hardStopPrice
+				}
+				holdReason = fmt.Sprintf("持仓中 %d 根K线，止损价=%.2f（当前=%.2f），评分=%.3f 未触发卖出阈值 %.2f%s",
+					s.barsSinceEntry, effectiveStop, closePrice, composite, s.sellThreshold, activeMark)
 			}
 		}
 	}
@@ -708,6 +760,7 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 		ATRStopMult:    s.atrStopMult,
 		ATRValue:       atr,
 		StopPrice:      stopPrice,
+		HardStopPrice:  hardStopPrice,
 		ClosePrice:     closePrice,
 		HoldReason:     holdReason,
 		Reason:         sig.Reason,

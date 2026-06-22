@@ -363,8 +363,12 @@
                 <span>最高价</span>
                 <span style="color: #ccc">{{ diagData.high_water_mark.toFixed(2) }}</span>
               </div>
+              <div class="diag-row" v-if="diagData.has_position && diagData.hard_stop_price > 0">
+                <span>硬止损</span>
+                <span style="color: #F56C6C">{{ diagData.hard_stop_price.toFixed(2) }}</span>
+              </div>
               <div class="diag-row" v-if="diagData.has_position">
-                <span>止损价</span>
+                <span>ATR止损</span>
                 <span style="color: #F56C6C">{{ diagData.stop_price.toFixed(2) }}</span>
               </div>
               <div class="diag-row" v-if="diagData.has_position">
@@ -401,6 +405,8 @@
           <span>冷却期</span><span>{{ liveConfig.cooldown_bars }}</span>
           <span>最短持仓</span><span>{{ liveConfig.min_hold_bars }}</span>
           <span>ATR止损倍数</span><span>{{ liveConfig.atr_stop_mult }}</span>
+          <span>ATR激活浮盈%</span><span>{{ liveConfig.atr_activate_profit_pct ?? 0 }}%</span>
+          <span>硬止损%</span><span>{{ liveConfig.hard_stop_pct ?? 0 }}%</span>
           <span>趋势过滤</span><span>{{ liveConfig.trend_filter ? '开启' : '关闭' }}</span>
           <span>大周期过滤</span><span>{{ liveConfig.htf_enabled ? liveConfig.htf_interval + ' / EMA' + liveConfig.htf_period : '关闭' }}</span>
         </div>
@@ -760,6 +766,8 @@ const fallbackSignalParams: ParamSchema[] = [
   { key: 'cooldown_bars', label: '冷却期', type: 'int', default: 12, min: 0, max: 48, step: 1, group: 'position', desc: '卖出后等待N根K线才允许再次买入' },
   { key: 'min_hold_bars', label: '最短持仓', type: 'int', default: 6, min: 0, max: 30, step: 1, group: 'position', desc: '买入后至少持有N根K线，避免频繁交易' },
   { key: 'atr_stop_mult', label: 'ATR止损倍数', type: 'float', default: 3.0, min: 1.0, max: 6.0, step: 0.1, group: 'stoploss', desc: '追踪止损距离 = ATR × 倍数，越大越宽松' },
+  { key: 'atr_activate_profit_pct', label: 'ATR激活浮盈%', type: 'float', default: 0.8, min: 0, max: 5.0, step: 0.1, group: 'stoploss', desc: '浮盈达到此百分比后才激活ATR追踪止损；0=始终激活（原有行为）' },
+  { key: 'hard_stop_pct', label: '硬止损%', type: 'float', default: 1.5, min: 0, max: 5.0, step: 0.1, group: 'stoploss', desc: 'ATR未激活时的兜底止损：亏损超过入场价×此比例即出场；0=禁用' },
   { key: 'trend_filter', label: 'EMA趋势过滤', type: 'bool', default: false, min: 0, max: 1, step: 1, group: 'trend', desc: '开启后只在价格高于EMA均线时买入，过滤下跌趋势' },
   { key: 'trend_period', label: 'EMA周期', type: 'int', default: 50, min: 20, max: 200, step: 5, group: 'trend', desc: '趋势判断用的均线周期，50表示看50根K线趋势' },
   { key: 'htf_enabled', label: '大周期过滤', type: 'bool', default: true, min: 0, max: 1, step: 1, group: 'trend', desc: '开启后用更大时间周期(如4h)确认趋势方向' },
@@ -782,18 +790,28 @@ const fallbackPresets: Record<string, SignalPreset> = {
 }
 
 function mergeSignalParams(apiParams: ParamSchema[]): ParamSchema[] {
-  // Merge group/desc/label from fallback if API doesn't have them
   const fallbackMap = new Map(fallbackSignalParams.map(p => [p.key, p]))
-  return apiParams.map(sp => {
+  const apiKeys = new Set(apiParams.map(p => p.key))
+
+  const merged = apiParams.map(sp => {
     const fb = fallbackMap.get(sp.key)
     if (!fb) return { ...sp, group: sp.group || 'signal', desc: sp.desc || '' }
     return {
       ...sp,
-      label: fb.label,  // always prefer our cleaner labels
+      label: fb.label,
       group: sp.group || fb.group || 'signal',
       desc: sp.desc || fb.desc || '',
     }
   })
+
+  // 补全 fallback 里有但 API 未返回的参数（兼容旧后端 / 新增字段热更新）
+  for (const fb of fallbackSignalParams) {
+    if (!apiKeys.has(fb.key)) {
+      merged.push({ ...fb, group: fb.group || 'signal', desc: fb.desc || '' })
+    }
+  }
+
+  return merged
 }
 
 async function loadModules() {

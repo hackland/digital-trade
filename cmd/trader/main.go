@@ -35,8 +35,8 @@ func main() {
 	defer logger.Sync()
 
 	logger.Info("btc-trader starting",
-		zap.String("mode", cfg.App.Mode),
 		zap.Bool("testnet", cfg.App.Testnet),
+		zap.String("mode", cfg.App.Mode),
 	)
 
 	// Context with graceful shutdown
@@ -54,7 +54,7 @@ func main() {
 	if *migrateOnly {
 		logger.Info("migrations complete, exiting")
 		return
-
+	}
 
 	// Run
 	if err := trader.Run(ctx); err != nil {
