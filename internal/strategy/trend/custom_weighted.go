@@ -1018,11 +1018,11 @@ func (s *CustomWeightedStrategy) effectiveBuyThreshold(htfDist, emaCrossScore fl
 			return base
 		}
 		return base * 1.5
-	case htfDist >= 1.0:
-		// 最佳区：原值不变
+	case htfDist >= 0.8:
+		// 最佳区(0.8%+)：原值不变
 		return base
 	default:
-		// 边缘区(0~1%)：轻微收紧
+		// 边缘区(0~0.8%)：刚刚站上EMA，轻微收紧
 		return base * 1.5
 	}
 }
