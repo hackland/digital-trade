@@ -63,7 +63,8 @@ type CustomWeightedStrategy struct {
 	highWaterMark        float64
 	entryPrice           float64
 	barsSinceEntry       int
-	klineInterval        string // "1m", "1h" 等,用于重启恢复 barsSinceEntry
+	klineInterval        string  // "1m", "1h" 等,用于重启恢复 barsSinceEntry
+	emaCrossMin          float64 // 做多时 ema_cross 模块分的最低门槛，0=禁用
 
 	// --- Short signal parameters (alert-only, independent of long) ---
 	shortEnabled      bool
@@ -152,12 +153,13 @@ func NewCustomWeightedStrategy() *CustomWeightedStrategy {
 		htfInterval:          "4h",
 		htfPeriod:            20,
 		confirmBars:          1,
-		cooldownBars:         2,
-		minHoldBars:          6,
-		atrStopMult:          3.0,
+		cooldownBars:         12,
+		minHoldBars:          18,
+		atrStopMult:          4.0,
 		atrPeriod:            14,
-		hardStopPct:          1.5,
-		atrActivateProfitPct: 0.8,
+		hardStopPct:          0,
+		atrActivateProfitPct: 0,
+		emaCrossMin:          0.15,
 		// Short defaults
 		shortEnabled:      false,
 		shortThreshold:    -0.35, // stricter default; replaces need for shortMinScoreAbs filter
@@ -285,6 +287,9 @@ func (s *CustomWeightedStrategy) init(cfg map[string]interface{}) error {
 	}
 	if v, ok := cfg["min_hold_bars"]; ok {
 		s.minHoldBars = toInt(v)
+	}
+	if v, ok := cfg["ema_cross_min"]; ok {
+		s.emaCrossMin = toFloat(v)
 	}
 	if v, ok := cfg["interval"]; ok {
 		if s2, ok := v.(string); ok && s2 != "" {
@@ -606,17 +611,22 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 			s.confirmCount = 0
 			htfBlocked = true
 			sig.Indicators["htf_blocked"] = 1.0
-		} else if composite < s.buyThreshold {
-			holdReason = fmt.Sprintf("综合评分 %.3f 未达买入阈值 %.2f（差 %.3f）", composite, s.buyThreshold, s.buyThreshold-composite)
+		} else if s.emaCrossMin > 0 && moduleScores["ema_cross"] < s.emaCrossMin {
+			holdReason = fmt.Sprintf("EMA cross 分 %.3f 未达最低门槛 %.2f", moduleScores["ema_cross"], s.emaCrossMin)
+			s.confirmCount = 0
+		} else if composite < s.effectiveBuyThreshold(htfDist, moduleScores["ema_cross"]) {
+			effective := s.effectiveBuyThreshold(htfDist, moduleScores["ema_cross"])
+			holdReason = fmt.Sprintf("综合评分 %.3f 未达动态买入阈值 %.2f（HTF距离 %.1f%%）", composite, effective, htfDist)
 			s.confirmCount = 0
 		} else {
 			s.confirmCount++
 			if s.confirmCount >= s.confirmBars {
+				effective := s.effectiveBuyThreshold(htfDist, moduleScores["ema_cross"])
 				sig.Action = strategy.Buy
 				sig.Strength = clamp(composite, 0.1, 1.0)
 				sig.Reason = fmt.Sprintf(
-					"Custom buy (score=%.2f, threshold=%.2f): %s",
-					composite, s.buyThreshold, strings.Join(scoreParts, ", "),
+					"Custom buy (score=%.2f, threshold=%.2f, htf_dist=%.1f%%): %s",
+					composite, effective, htfDist, strings.Join(scoreParts, ", "),
 				)
 				s.confirmCount = 0
 			} else {
@@ -989,6 +999,32 @@ func boolToFloat(b bool) float64 {
 		return 1.0
 	}
 	return 0.0
+}
+
+// effectiveBuyThreshold 根据日线EMA10距离和EMA cross分动态调整买入阈值。
+// 距离越小或越大（偏热）→ 要求更强的信号。0=HTF未启用时退回基础值。
+func (s *CustomWeightedStrategy) effectiveBuyThreshold(htfDist, emaCrossScore float64) float64 {
+	base := s.buyThreshold
+	if !s.htfEnabled || htfDist == 0 {
+		return base
+	}
+	switch {
+	case htfDist > 7.0:
+		// 超买：极严格
+		return base * 1.8
+	case htfDist > 3.0:
+		// 偏热：EMA cross 强则维持原值，弱则收紧
+		if emaCrossScore >= base*1.75 {
+			return base
+		}
+		return base * 1.5
+	case htfDist >= 1.0:
+		// 最佳区：原值不变
+		return base
+	default:
+		// 边缘区(0~1%)：轻微收紧
+		return base * 1.5
+	}
 }
 
 var _ strategy.Strategy = (*CustomWeightedStrategy)(nil)
