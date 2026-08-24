@@ -139,13 +139,19 @@ func (h *Handler) RunBacktest(c *gin.Context) {
 		AllocPct:    allocPct,
 	}
 
-	// Load HTF klines if strategy requires multi-TF
+	// Load HTF klines if strategy requires multi-TF. Fetch extra lookback before
+	// `start` so bars near the beginning of the backtest window aren't starved of
+	// HTF history (engine.findHTFWindow needs HTFHistSize*2 preceding HTF bars) —
+	// without this buffer, short backtest windows (e.g. 7D/30D) show htf_dist=0%
+	// for most or all of the run.
 	if cwStrat, ok := strat.(*trend.CustomWeightedStrategy); ok {
 		htfInterval := cwStrat.HTFInterval()
 		if htfInterval != "" {
-			htfKlines, htfErr := backtest.LoadKlinesFromStore(ctx, h.deps.Store, req.Symbol, htfInterval, start, end)
-			if htfErr != nil || len(htfKlines) < backtest.ExpectedKlineCount(htfInterval, start, end)*8/10 {
-				if fetched, fe := backtest.FetchKlinesFromExchange(ctx, h.deps.Exchange, req.Symbol, htfInterval, start, end); fe == nil {
+			htfHistSize := cwStrat.HTFHistoryRequired()
+			htfStart := start.Add(-time.Duration(htfHistSize*2+5) * backtest.IntervalDuration(htfInterval))
+			htfKlines, htfErr := backtest.LoadKlinesFromStore(ctx, h.deps.Store, req.Symbol, htfInterval, htfStart, end)
+			if htfErr != nil || len(htfKlines) < backtest.ExpectedKlineCount(htfInterval, htfStart, end)*8/10 {
+				if fetched, fe := backtest.FetchKlinesFromExchange(ctx, h.deps.Exchange, req.Symbol, htfInterval, htfStart, end); fe == nil {
 					htfKlines = fetched
 				}
 			}
@@ -153,7 +159,7 @@ func (h *Handler) RunBacktest(c *gin.Context) {
 				engineCfg.HTFKlines = htfKlines
 				engineCfg.HTFInterval = htfInterval
 				engineCfg.HTFIndReqs = cwStrat.HTFIndicatorRequirements()
-				engineCfg.HTFHistSize = cwStrat.HTFHistoryRequired()
+				engineCfg.HTFHistSize = htfHistSize
 			}
 		}
 	}

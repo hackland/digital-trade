@@ -425,6 +425,28 @@ type ExchangeKlineFetcher interface {
 }
 
 // ExpectedKlineCount estimates the number of klines between start and end for a given interval.
+// IntervalDuration returns the bar duration for a given kline interval string.
+func IntervalDuration(interval string) time.Duration {
+	switch interval {
+	case "1m":
+		return time.Minute
+	case "5m":
+		return 5 * time.Minute
+	case "15m":
+		return 15 * time.Minute
+	case "1h":
+		return time.Hour
+	case "4h":
+		return 4 * time.Hour
+	case "1d":
+		return 24 * time.Hour
+	case "1w":
+		return 7 * 24 * time.Hour
+	default:
+		return time.Hour
+	}
+}
+
 func ExpectedKlineCount(interval string, start, end time.Time) int {
 	dur := end.Sub(start)
 	switch interval {
