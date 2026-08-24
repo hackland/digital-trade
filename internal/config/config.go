@@ -26,10 +26,19 @@ type TelegramConfig struct {
 }
 
 type AppConfig struct {
-	Name     string `mapstructure:"name"`
-	Mode     string `mapstructure:"mode"`      // live | paper | backtest
-	LogLevel string `mapstructure:"log_level"` // debug | info | warn | error
-	Testnet  bool   `mapstructure:"testnet"`
+	Name          string              `mapstructure:"name"`
+	Mode          string              `mapstructure:"mode"`      // live | paper | backtest
+	LogLevel      string              `mapstructure:"log_level"` // debug | info | warn | error
+	Testnet       bool                `mapstructure:"testnet"`
+	SignalOnly    bool                `mapstructure:"signal_only"`    // true: 即使 mode=live 也不下单，只推送买卖点信号（trading_window 禁用时生效）
+	TradingWindow TradingWindowConfig `mapstructure:"trading_window"` // 按本地时间段覆盖 signal_only
+	InstanceLabel string              `mapstructure:"instance_label"` // 标在 Telegram 消息前缀里，区分是哪台机器发的（如 "VPS机器" / "本地cabbal"）
+}
+
+type TradingWindowConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	Start   string `mapstructure:"start"` // "HH:MM" 本地时间，窗口内允许实际下单
+	End     string `mapstructure:"end"`   // "HH:MM" 本地时间，跨零点也支持（如 22:00~06:00）
 }
 
 type ExchangeConfig struct {
@@ -123,6 +132,8 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("app.name", "btc-trader")
 	v.SetDefault("app.mode", "paper")
 	v.SetDefault("app.log_level", "info")
+	v.SetDefault("app.signal_only", false)
+	v.SetDefault("app.trading_window.enabled", false)
 	v.SetDefault("database.max_open_conns", 10)
 	v.SetDefault("database.max_idle_conns", 5)
 	v.SetDefault("database.conn_max_lifetime", "5m")

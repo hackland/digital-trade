@@ -23,6 +23,7 @@ let unsub: (() => void) | null = null
 
 onMounted(() => {
   unsub = ws.subscribe('ticker', (data: any) => {
+    if (data?.symbol !== 'BTCUSDT') return
     const p = data?.price
     if (p) {
       price.value = Number(p).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })

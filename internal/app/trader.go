@@ -274,7 +274,9 @@ func (t *Trader) Run(ctx context.Context) error {
 		return t.risk.ContinuousMonitor(gCtx)
 	})
 
-	// Order manager: tracks SL/TP fills, trailing stops, polls order status
+	// Order manager: tracks SL/TP fills, trailing stops, polls order status.
+	// Always runs in live mode so positions opened during the trading window
+	// keep being managed through the rest of the day.
 	if t.cfg.App.Mode == "live" {
 		g.Go(func() error {
 			return t.order.Run(gCtx)
@@ -337,12 +339,17 @@ func (t *Trader) Run(ctx context.Context) error {
 			Token:   t.cfg.Telegram.Token,
 			ChatID:  t.cfg.Telegram.ChatID,
 		}
-		// Mark messages to distinguish testnet / production-test in Telegram.
+		// Mark messages to distinguish testnet / production-test, and which machine sent them.
+		envLabel := "生产测试"
+		envEmoji := "🟢"
 		if t.cfg.App.Testnet {
-			tgCfg.Prefix = "🧪 *[测试]* "
-		} else {
-			tgCfg.Prefix = "🟢 *[生产测试]* "
+			envLabel = "测试"
+			envEmoji = "🧪"
 		}
+		if t.cfg.App.InstanceLabel != "" {
+			envLabel = envLabel + "·" + t.cfg.App.InstanceLabel
+		}
+		tgCfg.Prefix = fmt.Sprintf("%s *[%s]* ", envEmoji, envLabel)
 		tgNotifier := notify.NewTelegramNotifier(tgCfg, t.bus, t.logger.Named("telegram"))
 		g.Go(func() error {
 			return tgNotifier.Run(gCtx)
@@ -350,6 +357,43 @@ func (t *Trader) Run(ctx context.Context) error {
 	}
 
 	return g.Wait()
+}
+
+// effectiveSignalOnly reports whether new signals should be alert-only (no real order)
+// right now. When app.trading_window is enabled, it overrides app.signal_only based on
+// the current local clock time: real trading is only allowed inside [start, end); the
+// window wraps past midnight when start > end (e.g. 22:00~06:00). Outside the window, or
+// on invalid start/end, it falls back to the static app.signal_only value.
+func (t *Trader) effectiveSignalOnly() bool {
+	w := t.cfg.App.TradingWindow
+	if !w.Enabled {
+		return t.cfg.App.SignalOnly
+	}
+
+	start, err1 := time.Parse("15:04", w.Start)
+	end, err2 := time.Parse("15:04", w.End)
+	if err1 != nil || err2 != nil {
+		t.logger.Warn("invalid trading_window start/end, falling back to signal_only",
+			zap.String("start", w.Start), zap.String("end", w.End))
+		return t.cfg.App.SignalOnly
+	}
+
+	now := time.Now()
+	nowMin := now.Hour()*60 + now.Minute()
+	startMin := start.Hour()*60 + start.Minute()
+	endMin := end.Hour()*60 + end.Minute()
+
+	var inWindow bool
+	switch {
+	case startMin == endMin:
+		inWindow = true // 24h window
+	case startMin < endMin:
+		inWindow = nowMin >= startMin && nowMin < endMin
+	default:
+		inWindow = nowMin >= startMin || nowMin < endMin // wraps past midnight
+	}
+
+	return !inWindow
 }
 
 // Shutdown gracefully shuts down all components.
@@ -658,12 +702,14 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 						shortHandler.OnShortSignalProcessed(sig.Action, price)
 					}
 					t.store.SaveSignal(ctx, sig, false)
-				} else if t.cfg.App.Mode == "live" {
+				} else if t.cfg.App.Mode == "live" && (sig.Action == strategy.Sell || !t.effectiveSignalOnly()) {
+					// Sell always executes when live, regardless of signal_only/trading_window —
+					// those gate new entries, not exits. A position must always be closeable.
 					if err := t.order.ProcessSignal(ctx, sig); err != nil {
 						t.logger.Error("process signal", zap.Error(err))
 					}
 				} else {
-					// Paper mode: just log and persist signal
+					// Paper mode, or a buy blocked by signal_only: just log and persist signal
 					t.store.SaveSignal(ctx, sig, false)
 				}
 			}

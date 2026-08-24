@@ -3,6 +3,7 @@ app:
   mode: live           # live | paper | backtest
   log_level: info      # debug | info | warn | error
   testnet: false
+  signal_only: false   # true: 不实际下单，只推送买卖点信号（Telegram / Dashboard）
 
 exchange:
   name: binance

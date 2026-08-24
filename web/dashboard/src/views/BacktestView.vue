@@ -257,6 +257,23 @@
             <span style="color: #909399; margin-left: auto; font-size: 12px">{{ formatDiagTime(diagData.timestamp) }}</span>
           </div>
 
+          <!-- Entry quality caution (based on historical backtest analysis) -->
+          <el-alert
+            v-if="entryCaution"
+            type="warning"
+            show-icon
+            :closable="false"
+            style="margin-bottom: 16px"
+          >
+            <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+              <span>{{ entryCaution }}</span>
+              <el-link type="warning" :underline="false" @click="entryCautionExpanded = !entryCautionExpanded" style="font-size: 12px; white-space: nowrap">
+                {{ entryCautionExpanded ? '收起' : '详细' }}
+              </el-link>
+            </div>
+            <div v-if="entryCautionExpanded" style="margin-top: 10px; font-size: 12px; color: #606266; line-height: 1.7; white-space: pre-line">{{ entryCautionDetail }}</div>
+          </el-alert>
+
           <!-- Hold Reason (most important) -->
           <el-alert
             v-if="diagData.hold_reason"
@@ -336,6 +353,21 @@
               <div class="diag-row" v-if="diagData.htf_blocked">
                 <span>HTF拦截</span>
                 <el-tag type="danger" size="small">已拦截买入</el-tag>
+              </div>
+              <div v-if="diagData.htf_enabled" class="htf-note">
+                <span class="htf-note-toggle" @click="htfNoteOpen = !htfNoteOpen">
+                  HTF备注：动态买入阈值说明 {{ htfNoteOpen ? '▴' : '▾' }}
+                </span>
+                <div v-if="htfNoteOpen" class="htf-note-body">
+                  价格离日线EMA(HTF)越远，买入阈值(base={{ diagData.buy_threshold.toFixed(2) }})会动态提高，防止追高买在阶段性顶部：
+                  <table class="htf-note-table">
+                    <tr><td>HTF距离 &gt; 7%</td><td>阈值 × 1.8（超买，极严格）</td></tr>
+                    <tr><td>HTF距离 3%~7%</td><td>阈值 × 1.5（ema_cross分足够强则维持原值）</td></tr>
+                    <tr><td>HTF距离 0.8%~3%</td><td>阈值不变（最佳区）</td></tr>
+                    <tr><td>HTF距离 0~0.8%</td><td>阈值 × 1.5（刚站上均线，边缘区）</td></tr>
+                  </table>
+                  当前 HTF 距离 {{ diagData.htf_ema_dist_pct.toFixed(2) }}%，落在对应档位；具体倍数后的阈值以"原因"文字里的数字为准。
+                </div>
               </div>
             </el-card>
             <!-- Right: Position State -->
@@ -693,6 +725,38 @@ const loadingLive = ref(false)
 const loadingDiag = ref(false)
 const diagVisible = ref(false)
 const diagData = ref<StrategyDiagnostics | null>(null)
+const htfNoteOpen = ref(false)
+
+// 历史回测发现：ema_cross 分偏弱(<0.25)或 htf 距离贴近边缘区(0~0.8%)时，
+// 买入后更容易被止损，即使综合分不低。这里只做人工复核提示，不影响任何判断逻辑。
+const entryCaution = computed(() => {
+  const d = diagData.value
+  if (!d || !d.module_scores) return null
+  const emaWeak = (d.module_scores.ema_cross ?? 1) < 0.25
+  const htfEdge = d.htf_enabled && d.htf_bullish && d.htf_ema_dist_pct < 0.8
+  if (!emaWeak && !htfEdge) return null
+  const parts: string[] = []
+  if (emaWeak) parts.push(`ema_cross分偏弱(${d.module_scores.ema_cross.toFixed(2)})`)
+  if (htfEdge) parts.push(`大周期距离贴边(${d.htf_ema_dist_pct.toFixed(2)}%)`)
+  return `⚠️ 入场质量偏弱：${parts.join('，')}，历史上这类信号更容易被止损，建议人工复核`
+})
+
+const entryCautionExpanded = ref(false)
+const entryCautionDetail = computed(() => {
+  const d = diagData.value
+  const live = d?.module_scores
+    ? `\n\n当前值：ema_cross=${d.module_scores.ema_cross.toFixed(2)}，大周期距离=${d.htf_ema_dist_pct.toFixed(2)}%`
+    : ''
+  return `历史数据分析（macd45+ema35+mfi20，4h，过去一年34笔交易统计）：
+
+· 买入时 ema_cross 分量得分：赢的交易均值 0.42，亏的交易均值 0.33。低于 0.25~0.30 时更容易被止损，即使 macd 很强、综合分很高也一样。
+
+· 买入时大周期距离(htf_dist，离1d EMA10的距离)：赢的交易均值 1.34%，亏的交易均值 1.07%。越接近 0%（刚爬上日线均线没多久）越容易被打回去；站稳 1% 以上相对更安全。
+
+· 典型反例：2026-02-26 那笔综合分高达 0.62（全年最强信号之一），但 ema_cross 只有 0.20、大周期距离只有 1.3%，结果是全年最大亏损 -5.28%。
+
+样本只有34笔，是历史倾向不是铁律，仅供人工复核参考，不代表这次一定会亏。${live}`
+})
 const liveDialogVisible = ref(false)
 const liveConfig = ref<Record<string, any> | null>(null)
 const result = ref<BacktestResult | null>(null)
@@ -726,7 +790,6 @@ const signalGroups = [
   { key: 'position', label: '持仓控制' },
   { key: 'stoploss', label: '止损' },
   { key: 'trend', label: '趋势过滤' },
-  { key: 'short', label: '做空策略 (仅告警)' },
 ]
 
 function getParamsByGroup(group: string): ParamSchema[] {
@@ -761,12 +824,13 @@ let allModules: ModuleMeta[] = []
 
 const fallbackSignalParams: ParamSchema[] = [
   { key: 'buy_threshold', label: '买入阈值', type: 'float', default: 0.20, min: 0.05, max: 0.8, step: 0.05, group: 'signal', desc: '综合评分超过此值才触发买入，越高越严格' },
-  { key: 'sell_threshold', label: '卖出阈值', type: 'float', default: -0.30, min: -1.0, max: -0.1, step: 0.05, group: 'signal', desc: '综合评分低于此值触发卖出，越低越宽松' },
+  { key: 'sell_threshold', label: '卖出阈值', type: 'float', default: -0.25, min: -1.0, max: -0.1, step: 0.05, group: 'signal', desc: '综合评分低于此值触发卖出，越低越宽松' },
   { key: 'confirm_bars', label: '确认K线数', type: 'int', default: 1, min: 1, max: 5, step: 1, group: 'signal', desc: '连续N根K线评分达标才买入，防止假信号' },
+  { key: 'ema_cross_min', label: 'EMA确认门槛', type: 'float', default: 0.15, min: 0, max: 0.5, step: 0.05, group: 'signal', desc: '做多时 EMA金叉死叉模块分必须达到此值，0=不限制' },
   { key: 'cooldown_bars', label: '冷却期', type: 'int', default: 12, min: 0, max: 48, step: 1, group: 'position', desc: '卖出后等待N根K线才允许再次买入' },
-  { key: 'min_hold_bars', label: '最短持仓', type: 'int', default: 6, min: 0, max: 30, step: 1, group: 'position', desc: '买入后至少持有N根K线，避免频繁交易' },
-  { key: 'atr_stop_mult', label: 'ATR止损倍数', type: 'float', default: 3.0, min: 1.0, max: 6.0, step: 0.1, group: 'stoploss', desc: '追踪止损距离 = ATR × 倍数，越大越宽松' },
-  { key: 'atr_activate_profit_pct', label: 'ATR激活浮盈%', type: 'float', default: 0.8, min: 0, max: 5.0, step: 0.1, group: 'stoploss', desc: '浮盈达到此百分比后才激活ATR追踪止损；0=始终激活（原有行为）' },
+  { key: 'min_hold_bars', label: '最短持仓', type: 'int', default: 18, min: 0, max: 60, step: 1, group: 'position', desc: '买入后至少持有N根K线，避免频繁交易' },
+  { key: 'atr_stop_mult', label: 'ATR止损倍数', type: 'float', default: 3.0, min: 1.0, max: 8.0, step: 0.1, group: 'stoploss', desc: '追踪止损距离 = ATR × 倍数，越大越宽松' },
+  { key: 'atr_activate_profit_pct', label: 'ATR激活浮盈%', type: 'float', default: 0.0, min: 0, max: 5.0, step: 0.1, group: 'stoploss', desc: '浮盈达到此百分比后才激活ATR追踪止损；0=始终激活（原有行为）' },
   { key: 'hard_stop_pct', label: '硬止损%', type: 'float', default: 1.5, min: 0, max: 5.0, step: 0.1, group: 'stoploss', desc: 'ATR未激活时的兜底止损：亏损超过入场价×此比例即出场；0=禁用' },
   { key: 'trend_filter', label: 'EMA趋势过滤', type: 'bool', default: false, min: 0, max: 1, step: 1, group: 'trend', desc: '开启后只在价格高于EMA均线时买入，过滤下跌趋势' },
   { key: 'trend_period', label: 'EMA周期', type: 'int', default: 50, min: 20, max: 200, step: 5, group: 'trend', desc: '趋势判断用的均线周期，50表示看50根K线趋势' },
@@ -979,7 +1043,7 @@ async function showLiveStrategy() {
 async function showDiagnostics() {
   loadingDiag.value = true
   try {
-    diagData.value = await getStrategyDiagnostics()
+    diagData.value = await getStrategyDiagnostics(form.value.symbol)
     diagVisible.value = true
   } catch (e: any) {
     ElMessage.error('获取失败: ' + (e.response?.data?.message || e.message))
@@ -1338,6 +1402,42 @@ onBeforeUnmount(() => {
 }
 .diag-row span:first-child {
   color: #909399;
+}
+
+.htf-note {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed #333;
+}
+.htf-note-toggle {
+  cursor: pointer;
+  color: #f0b90b;
+  font-size: 12px;
+  user-select: none;
+}
+.htf-note-toggle:hover {
+  text-decoration: underline;
+}
+.htf-note-body {
+  margin-top: 6px;
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.htf-note-table {
+  width: 100%;
+  margin: 6px 0;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.htf-note-table td {
+  padding: 3px 6px;
+  border: 1px solid #333;
+  color: #ccc;
+}
+.htf-note-table td:first-child {
+  color: #909399;
+  white-space: nowrap;
 }
 
 :deep(.el-form-item__label) {

@@ -1,48 +1,15 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
-import { ElNotification } from 'element-plus'
+import { ref } from 'vue'
 import Sidebar from './Sidebar.vue'
 import Header from './Header.vue'
-import { useWebSocket } from '@/composables/useWebSocket'
 import PositionAnalysisDrawer from '@/components/dashboard/PositionAnalysisDrawer.vue'
 
 const alertDrawerVisible = ref(false)
 const alertSymbol = ref('')
 
-let wsUnsub: (() => void) | null = null
-
-// 持仓风险告警弹窗暂时关闭（提示太频繁）。
-// 需要恢复时把下面这段取消注释即可，后端 WS 推送和 alert 抽屉不受影响。
-onMounted(() => {
-  // const ws = useWebSocket()
-  // wsUnsub = ws.subscribe('position_alert', (data: any) => {
-  //   const symbol: string = data?.symbol ?? ''
-  //   const label: string = data?.regime_label ?? ''
-  //   const recommendation: string = data?.recommendation ?? ''
-  //   const summary: string = data?.reason_summary ?? ''
-  //
-  //   const recMap: Record<string, string> = {
-  //     consider_close: '建议考虑平仓',
-  //     close_now:      '建议立即平仓',
-  //   }
-  //   const title = `⚠️ 持仓风险告警 · ${symbol}`
-  //   const msg = `${recMap[recommendation] ?? recommendation}：${summary}（${label}）`
-  //
-  //   ElNotification({
-  //     title,
-  //     message: msg,
-  //     type: recommendation === 'close_now' ? 'error' : 'warning',
-  //     duration: 0,
-  //     position: 'bottom-right',
-  //     onClick() {
-  //       alertSymbol.value = symbol
-  //       alertDrawerVisible.value = true
-  //     },
-  //   })
-  // })
-})
-
-onUnmounted(() => { wsUnsub?.() })
+// 持仓风险告警弹窗暂时关闭（提示太频繁）。恢复时参考 git history 里
+// 这段 onMounted 订阅 'position_alert' 并弹 ElNotification 的实现，
+// 点击后设置 alertSymbol/alertDrawerVisible 打开下面的抽屉。
 </script>
 
 <template>

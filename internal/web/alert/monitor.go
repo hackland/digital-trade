@@ -85,7 +85,7 @@ func (m *Monitor) checkPosition(ctx context.Context, pos *position.Position) {
 	var holdReason string
 	var htfBullish, htfBlocked bool
 	if cw, ok := m.deps.Strategy.(*trend.CustomWeightedStrategy); ok {
-		if diag := cw.GetDiagnostics(); diag != nil {
+		if diag := cw.GetDiagnostics(symbol); diag != nil {
 			compositeScore = diag.CompositeScore
 			sellThreshold = diag.SellThreshold
 			stopPrice = diag.StopPrice

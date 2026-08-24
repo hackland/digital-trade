@@ -94,8 +94,8 @@ type CustomWeightedStrategy struct {
 	shortLowWaterMark   float64 // lowest price since short entry (for trailing stop)
 	shortBarsSinceEntry int
 
-	// Last evaluation diagnostics (updated every Evaluate call)
-	lastDiag *Diagnostics
+	// Last evaluation diagnostics per symbol (updated every Evaluate call)
+	lastDiagBySymbol map[string]*Diagnostics
 }
 
 // Diagnostics holds the latest strategy evaluation state for live monitoring.
@@ -177,6 +177,8 @@ func NewCustomWeightedStrategy() *CustomWeightedStrategy {
 		shortADXPeriod:   14,
 		shortADXMin:      20,
 		shortADXDIFilter: true,
+
+		lastDiagBySymbol: make(map[string]*Diagnostics),
 	}
 }
 
@@ -248,11 +250,11 @@ func (s *CustomWeightedStrategy) GetConfig() map[string]interface{} {
 	}
 }
 
-// GetDiagnostics returns the latest evaluation diagnostics. Thread-safe.
-func (s *CustomWeightedStrategy) GetDiagnostics() *Diagnostics {
+// GetDiagnostics returns the latest evaluation diagnostics for the given symbol. Thread-safe.
+func (s *CustomWeightedStrategy) GetDiagnostics(symbol string) *Diagnostics {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.lastDiag
+	return s.lastDiagBySymbol[symbol]
 }
 
 func (s *CustomWeightedStrategy) Init(cfg map[string]interface{}) error {
@@ -582,12 +584,14 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 	htfBullish := true // default: no filter
 	htfBlocked := false
 	htfDist := 0.0
+	htfDataOK := false // true only when we actually computed a real HTF distance, vs. missing/warming-up data
 	if s.htfEnabled && len(snap.HTFKlines) > 0 {
 		htfEMA := snap.HTFIndicators.EMA[s.htfPeriod]
 		htfPrice := snap.HTFKlines[len(snap.HTFKlines)-1].Close
 		if htfEMA > 0 && htfPrice > 0 {
 			htfBullish = htfPrice > htfEMA
 			htfDist = (htfPrice - htfEMA) / htfEMA * 100
+			htfDataOK = true
 			sig.Indicators["htf_ema_dist_pct"] = htfDist
 			sig.Indicators["htf_bullish"] = boolToFloat(htfBullish)
 		}
@@ -614,19 +618,30 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 		} else if s.emaCrossMin > 0 && moduleScores["ema_cross"] < s.emaCrossMin {
 			holdReason = fmt.Sprintf("EMA cross 分 %.3f 未达最低门槛 %.2f", moduleScores["ema_cross"], s.emaCrossMin)
 			s.confirmCount = 0
-		} else if composite < s.effectiveBuyThreshold(htfDist, moduleScores["ema_cross"]) {
-			effective := s.effectiveBuyThreshold(htfDist, moduleScores["ema_cross"])
+		} else if composite < s.effectiveBuyThreshold(htfDataOK, htfDist, moduleScores["ema_cross"]) {
+			effective := s.effectiveBuyThreshold(htfDataOK, htfDist, moduleScores["ema_cross"])
 			holdReason = fmt.Sprintf("综合评分 %.3f 未达动态买入阈值 %.2f（HTF距离 %.1f%%）", composite, effective, htfDist)
 			s.confirmCount = 0
 		} else {
 			s.confirmCount++
 			if s.confirmCount >= s.confirmBars {
-				effective := s.effectiveBuyThreshold(htfDist, moduleScores["ema_cross"])
+				effective := s.effectiveBuyThreshold(htfDataOK, htfDist, moduleScores["ema_cross"])
+				htfLabel := "看空"
+				if htfBullish {
+					htfLabel = "看多"
+				}
+				// 历史数据显示 ema_cross 分偏弱或 htf 距离贴近边缘区(0~0.8%)时，
+				// 买入后更容易被止损，即使综合分和其它模块分都不低。仅作为人工
+				// 复核提示，不影响买入决策本身。
+				caution := ""
+				if moduleScores["ema_cross"] < 0.25 || (s.htfEnabled && htfDist < 0.8) {
+					caution = "，⚠️入场质量偏弱，建议人工复核"
+				}
 				sig.Action = strategy.Buy
 				sig.Strength = clamp(composite, 0.1, 1.0)
 				sig.Reason = fmt.Sprintf(
-					"Custom buy (score=%.2f, threshold=%.2f, htf_dist=%.1f%%): %s",
-					composite, effective, htfDist, strings.Join(scoreParts, ", "),
+					"Custom buy (score=%.2f, threshold=%.2f, htf=%s(%.1f%%)): %s%s",
+					composite, effective, htfLabel, htfDist, strings.Join(scoreParts, ", "), caution,
 				)
 				s.confirmCount = 0
 			} else {
@@ -742,7 +757,7 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 	}
 
 	// --- Save diagnostics ---
-	s.lastDiag = &Diagnostics{
+	s.lastDiagBySymbol[snap.Symbol] = &Diagnostics{
 		Timestamp:      snap.Timestamp.Format("2006-01-02T15:04:05Z07:00"),
 		Symbol:         snap.Symbol,
 		Action:         sig.Action.String(),
@@ -1002,10 +1017,11 @@ func boolToFloat(b bool) float64 {
 }
 
 // effectiveBuyThreshold 根据日线EMA10距离和EMA cross分动态调整买入阈值。
-// 距离越小或越大（偏热）→ 要求更强的信号。0=HTF未启用时退回基础值。
-func (s *CustomWeightedStrategy) effectiveBuyThreshold(htfDist, emaCrossScore float64) float64 {
+// 距离越小或越大（偏热）→ 要求更强的信号。HTF未启用或数据缺失（htfDataOK=false）时退回基础值——
+// 注意数据缺失不等于"距离为0"，避免把真实的边缘区(0~0.8%)误判成无过滤。
+func (s *CustomWeightedStrategy) effectiveBuyThreshold(htfDataOK bool, htfDist, emaCrossScore float64) float64 {
 	base := s.buyThreshold
-	if !s.htfEnabled || htfDist == 0 {
+	if !s.htfEnabled || !htfDataOK {
 		return base
 	}
 	switch {

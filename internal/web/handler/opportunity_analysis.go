@@ -69,7 +69,7 @@ func (h *Handler) GetOpportunityAnalysis(c *gin.Context) {
 
 	// Strategy diagnostics
 	if cw, ok := h.deps.Strategy.(*trend.CustomWeightedStrategy); ok {
-		if d := cw.GetDiagnostics(); d != nil {
+		if d := cw.GetDiagnostics(symbol); d != nil {
 			a.CompositeScore = d.CompositeScore
 			a.BuyThreshold = d.BuyThreshold
 			a.HTFBullish = d.HTFBullish

@@ -175,7 +175,7 @@ export interface StrategyDiagnostics {
   reason: string
 }
 
-export async function getStrategyDiagnostics(): Promise<StrategyDiagnostics> {
-  const res = await http.get<ApiResponse<StrategyDiagnostics>>('/strategy/diagnostics')
+export async function getStrategyDiagnostics(symbol: string): Promise<StrategyDiagnostics> {
+  const res = await http.get<ApiResponse<StrategyDiagnostics>>('/strategy/diagnostics', { params: { symbol } })
   return res.data.data
 }

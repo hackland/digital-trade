@@ -79,7 +79,7 @@ func (s *Store) GetKlines(ctx context.Context, symbol, interval string, start, e
 	}
 	defer rows.Close()
 
-	var klines []exchange.Kline
+	klines := make([]exchange.Kline, 0)
 	for rows.Next() {
 		var k exchange.Kline
 		err := rows.Scan(

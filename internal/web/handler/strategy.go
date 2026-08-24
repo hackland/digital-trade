@@ -53,16 +53,16 @@ func (h *Handler) GetIndicatorModules(c *gin.Context) {
 		"signal_params": []modules.ParamSchema{
 			// 买卖信号
 			{Key: "buy_threshold", Label: "买入阈值", Type: "float", Default: 0.20, Min: 0.05, Max: 0.8, Step: 0.05, Group: "signal", Desc: "综合评分超过此值才触发买入，越高越严格"},
-			{Key: "sell_threshold", Label: "卖出阈值", Type: "float", Default: -0.30, Min: -1.0, Max: -0.1, Step: 0.05, Group: "signal", Desc: "综合评分低于此值触发卖出，越低越宽松"},
+			{Key: "sell_threshold", Label: "卖出阈值", Type: "float", Default: -0.25, Min: -1.0, Max: -0.1, Step: 0.05, Group: "signal", Desc: "综合评分低于此值触发卖出，越低越宽松"},
 			{Key: "confirm_bars", Label: "确认K线数", Type: "int", Default: 1, Min: 1, Max: 5, Step: 1, Group: "signal", Desc: "连续N根K线评分达标才买入，防止假信号"},
 			{Key: "ema_cross_min", Label: "EMA确认门槛", Type: "float", Default: 0.15, Min: 0, Max: 0.5, Step: 0.05, Group: "signal", Desc: "做多时 EMA金叉死叉模块分必须达到此值，0=不限制"},
 			// 持仓控制
 			{Key: "cooldown_bars", Label: "冷却期", Type: "int", Default: 12, Min: 0, Max: 48, Step: 1, Group: "position", Desc: "卖出后等待N根K线才允许再次买入"},
 			{Key: "min_hold_bars", Label: "最短持仓", Type: "int", Default: 18, Min: 0, Max: 60, Step: 1, Group: "position", Desc: "买入后至少持有N根K线，避免频繁交易"},
 			// 止损
-			{Key: "atr_stop_mult", Label: "ATR止损倍数", Type: "float", Default: 4.0, Min: 1.0, Max: 8.0, Step: 0.1, Group: "stoploss", Desc: "追踪止损距离 = ATR × 倍数，越大越宽松"},
+			{Key: "atr_stop_mult", Label: "ATR止损倍数", Type: "float", Default: 3.0, Min: 1.0, Max: 8.0, Step: 0.1, Group: "stoploss", Desc: "追踪止损距离 = ATR × 倍数，越大越宽松"},
 			{Key: "atr_activate_profit_pct", Label: "ATR激活浮盈%", Type: "float", Default: 0, Min: 0, Max: 5.0, Step: 0.1, Group: "stoploss", Desc: "浮盈达到此百分比后才激活ATR追踪止损；0=始终激活"},
-			{Key: "hard_stop_pct", Label: "硬止损%", Type: "float", Default: 0, Min: 0, Max: 5.0, Step: 0.1, Group: "stoploss", Desc: "持仓锁结束后的兜底止损，亏损超过入场价×此比例即出场；0=禁用"},
+			{Key: "hard_stop_pct", Label: "硬止损%", Type: "float", Default: 1.5, Min: 0, Max: 5.0, Step: 0.1, Group: "stoploss", Desc: "持仓锁结束后的兜底止损，亏损超过入场价×此比例即出场；0=禁用"},
 			// 趋势过滤
 			{Key: "trend_filter", Label: "EMA趋势过滤", Type: "bool", Default: false, Min: 0, Max: 1, Step: 1, Group: "trend", Desc: "开启后只在价格高于EMA均线时买入，过滤下跌趋势"},
 			{Key: "trend_period", Label: "EMA周期", Type: "int", Default: 50, Min: 20, Max: 200, Step: 5, Group: "trend", Desc: "趋势判断用的均线周期，50表示看50根K线趋势"},
@@ -137,7 +137,8 @@ func (h *Handler) GetStrategyDiagnostics(c *gin.Context) {
 		return
 	}
 
-	diag := cw.GetDiagnostics()
+	symbol := c.DefaultQuery("symbol", "BTCUSDT")
+	diag := cw.GetDiagnostics(symbol)
 	if diag == nil {
 		ok(c, gin.H{
 			"message": "策略尚未执行过评估，等待下一根K线收线...",
