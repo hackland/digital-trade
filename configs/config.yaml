@@ -1,0 +1,87 @@
+app:
+  name: btc-trader
+  mode: live            # live | paper | backtest — 00:00~08:00 自动下单需要 live，白天靠 trading_window 转回信号模式
+  log_level: info      # debug | info | warn | error
+  testnet: false
+  signal_only: true    # true=不实际下单，只推送买卖点信号（已暂停自动下单）
+  instance_label: "VPS机器"
+  trading_window:
+    enabled: false     # 暂停夜间自动下单，全天只提醒不下单；要恢复把这里改回 true
+    start: "00:00"
+    end: "08:00"
+
+exchange:
+  name: binance
+  market_type: spot    # spot | usdt_futures
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+  kline_intervals:
+    - 1m
+    - 5m
+    - 1h
+
+database:
+  dsn: postgres://trader:trader123@localhost:5432/btc_trader?sslmode=disable
+  max_open_conns: 10
+  max_idle_conns: 5
+  conn_max_lifetime: 5m
+
+strategy:
+  name: custom_weighted   # 当前唯一注册的策略
+  config:                 # 与 Dashboard 前端「标准」预设的做多默认配置一致
+    interval: 1h
+    modules:
+      - name: ema_cross
+        weight: 0.4
+        params:
+          fast_period: 9
+          slow_period: 21
+      - name: macd
+        weight: 0.4
+        params:
+          fast: 12
+          slow: 26
+          signal: 9
+      - name: mfi
+        weight: 0.2
+        params:
+          period: 14
+    buy_threshold: 0.2
+    sell_threshold: -0.25
+    confirm_bars: 1
+    ema_cross_min: 0.15
+    cooldown_bars: 12
+    min_hold_bars: 18
+    atr_stop_mult: 3.0
+    atr_activate_profit_pct: 0.0
+    hard_stop_pct: 1.5
+    trend_filter: false
+    trend_period: 50
+    htf_enabled: true
+    htf_interval: 1d
+    htf_period: 10
+    short_enabled: false
+    short_threshold: -0.25
+    cover_threshold: 0.15
+    short_confirm_bars: 1
+    short_min_hold_bars: 12
+    short_atr_stop_mult: 2.5
+    short_cooldown_bars: 8
+
+risk:   # 仓位上限/日频率/熔断等已按你的要求去掉，只留买单成交后交易所层面的真实止损，不然完全没有兜底
+  default_stop_loss_pct: 0.02   # 买入成交后立刻挂交易所止损单：入场价 -2%
+  trailing_stop_enabled: true   # 逐笔行情驱动的移动止损
+  trailing_stop_pct: 0.015      # 从最高点回撤 1.5% 触发
+
+dashboard:
+  enabled: true
+  addr: ":9090"
+
+snapshot:
+  interval: 5m
+
+telegram:
+  enabled: true
+  token: "8807136785:AAHWK0JWkr18GPZcaHOszEZubjBb7XzTIDs"
+  chat_id: "8447620872"
