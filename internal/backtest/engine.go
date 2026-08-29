@@ -31,7 +31,7 @@ type EngineConfig struct {
 // ShortSignalHandler is an optional interface for strategies that support short signals.
 // The backtest engine uses this to update the strategy's virtual short state.
 type ShortSignalHandler interface {
-	OnShortSignalProcessed(action strategy.Action, price float64)
+	OnShortSignalProcessed(symbol string, action strategy.Action, price float64)
 }
 
 // Engine drives the backtest simulation.
@@ -213,7 +213,7 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 
 					// Notify strategy
 					if shortHandler, ok := e.strat.(ShortSignalHandler); ok {
-						shortHandler.OnShortSignalProcessed(strategy.Short, currentBar.Close)
+						shortHandler.OnShortSignalProcessed(symbol, strategy.Short, currentBar.Close)
 					}
 
 					shortTradeRecords = append(shortTradeRecords, TradeRecord{
@@ -232,7 +232,7 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 			fee := currentBar.Close * shortPositionQty * e.cfg.FeeRate
 
 			if shortHandler, ok := e.strat.(ShortSignalHandler); ok {
-				shortHandler.OnShortSignalProcessed(strategy.Cover, currentBar.Close)
+				shortHandler.OnShortSignalProcessed(symbol, strategy.Cover, currentBar.Close)
 			}
 
 			shortTradeRecords = append(shortTradeRecords, TradeRecord{
@@ -332,7 +332,7 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 		fee := lastPrice * shortPositionQty * e.cfg.FeeRate
 
 		if shortHandler, ok := e.strat.(ShortSignalHandler); ok {
-			shortHandler.OnShortSignalProcessed(strategy.Cover, lastPrice)
+			shortHandler.OnShortSignalProcessed(symbol, strategy.Cover, lastPrice)
 		}
 
 		shortTradeRecords = append(shortTradeRecords, TradeRecord{

@@ -203,8 +203,8 @@ func (t *Trader) Run(ctx context.Context) error {
 									maxHigh = k.High
 								}
 							}
-							if hwSetter, ok := t.strat.(interface{ SetHighWaterMark(float64) }); ok {
-								hwSetter.SetHighWaterMark(maxHigh)
+							if hwSetter, ok := t.strat.(interface{ SetHighWaterMark(string, float64) }); ok {
+								hwSetter.SetHighWaterMark(sym, maxHigh)
 							}
 							t.logger.Info("position state recovered from trades table",
 								zap.String("symbol", sym),
@@ -693,13 +693,13 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 					// Short/Cover: alert only — publish event (→ Telegram) but do NOT place orders
 					// Update strategy's virtual short state
 					if shortHandler, ok := t.strat.(interface {
-						OnShortSignalProcessed(strategy.Action, float64)
+						OnShortSignalProcessed(string, strategy.Action, float64)
 					}); ok {
 						price := float64(0)
 						if len(snapshot.Klines) > 0 {
 							price = snapshot.Klines[len(snapshot.Klines)-1].Close
 						}
-						shortHandler.OnShortSignalProcessed(sig.Action, price)
+						shortHandler.OnShortSignalProcessed(sig.Symbol, sig.Action, price)
 					}
 					t.store.SaveSignal(ctx, sig, false)
 				} else if t.cfg.App.Mode == "live" && (sig.Action == strategy.Sell || !t.effectiveSignalOnly()) {
