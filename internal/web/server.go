@@ -52,6 +52,7 @@ func NewServer(deps *handler.Deps, logger *zap.Logger) *Server {
 		api.GET("/orders/active", h.GetActiveOrders)
 		api.GET("/orders/:id", h.GetOrder)
 		api.GET("/trades", h.GetTrades)
+		api.GET("/virtual-ledger", h.GetVirtualLedger)
 		api.GET("/signals", h.GetSignals)
 		api.GET("/snapshots", h.GetSnapshots)
 		api.GET("/klines", h.GetKlines)

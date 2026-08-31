@@ -17,7 +17,6 @@ coverage.txt
 *.swo
 
 # Config with secrets
-configs/config.yaml
 .env
 
 # OS

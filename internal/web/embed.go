@@ -21,15 +21,21 @@ func registerStaticFiles(engine *gin.Engine) {
 	}
 	fileServer := http.FileServer(http.FS(sub))
 	engine.NoRoute(func(c *gin.Context) {
-		path := strings.TrimPrefix(c.Request.URL.Path, "/")
-		if f, err := sub.Open(path); err == nil {
-			f.Close()
-			fileServer.ServeHTTP(c.Writer, c.Request)
+		// API 路由未命中时保持 404，不要回退到 index.html。
+		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			c.Status(http.StatusNotFound)
 			return
 		}
-		// Unknown path (e.g. /backtest, a Vue Router history-mode route): fall
-		// back to index.html so the client-side router can render it, instead
-		// of 404ing on a direct navigation/refresh to a non-root URL.
+		// 命中真实静态资源（js/css/assets 等）就直接返回。
+		reqPath := strings.TrimPrefix(c.Request.URL.Path, "/")
+		if reqPath != "" {
+			if f, err := sub.Open(reqPath); err == nil {
+				f.Close()
+				fileServer.ServeHTTP(c.Writer, c.Request)
+				return
+			}
+		}
+		// SPA fallback：未知路径（如 /backtest）回退到 index.html，交给前端路由。
 		c.Request.URL.Path = "/"
 		fileServer.ServeHTTP(c.Writer, c.Request)
 	})

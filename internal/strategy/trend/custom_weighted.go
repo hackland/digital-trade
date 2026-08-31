@@ -26,10 +26,17 @@ import (
 //   - Minimum hold period: prevents premature exits
 //   - ATR trailing stop: volatility-adaptive stop loss
 type CustomWeightedStrategy struct {
-	mu sync.RWMutex // protects reconfiguration
+	mu sync.RWMutex // protects reconfiguration and all per-symbol state below
 
-	// Active modules with weights
-	weightedModules []weightedMod
+	// Module configuration (name/weight/params), shared across symbols.
+	// Used to spin up an independent set of module instances per symbol —
+	// each module (e.g. MACD, ema_cross) carries its own "prev value" state
+	// for crossover detection, so instances must never be shared between symbols.
+	moduleSpecs []moduleSpec
+	// templateModules mirrors moduleSpecs as instantiated modules, used only
+	// to answer metadata queries (RequiredIndicators/RequiredHistory/GetConfig).
+	// Its internal running state is never used for scoring.
+	templateModules []weightedMod
 
 	// Signal thresholds
 	buyThreshold  float64
@@ -45,12 +52,10 @@ type CustomWeightedStrategy struct {
 	htfPeriod   int    // EMA period on higher TF (e.g., 20 on 4h = 80h lookback)
 
 	// Signal confirmation
-	confirmBars  int
-	confirmCount int // consecutive bars above buy threshold
+	confirmBars int
 
 	// Cooldown after exit
-	cooldownBars  int
-	cooldownCount int
+	cooldownBars int
 
 	// Minimum hold period: don't sell before this many bars
 	minHoldBars int
@@ -60,9 +65,6 @@ type CustomWeightedStrategy struct {
 	atrPeriod            int
 	hardStopPct          float64 // max loss % from entry before ATR activates (0=disabled)
 	atrActivateProfitPct float64 // ATR trailing only after this % profit (0=always active)
-	highWaterMark        float64
-	entryPrice           float64
-	barsSinceEntry       int
 	klineInterval        string  // "1m", "1h" 等,用于重启恢复 barsSinceEntry
 	emaCrossMin          float64 // 做多时 ema_cross 模块分的最低门槛，0=禁用
 
@@ -86,6 +88,37 @@ type CustomWeightedStrategy struct {
 	shortADXMin      float64 // ADX最小值, >此值才开空 (默认20, 表示有趋势)
 	shortADXDIFilter bool    // 是否要求 -DI > +DI (空头趋势确认)
 
+	// Per-symbol runtime state: modules instances, position tracking, virtual
+	// short position. Keyed by symbol so BTCUSDT and ETHUSDT (etc.) never
+	// share an entry price / high-water mark / indicator history.
+	states map[string]*symbolState
+
+	// Last evaluation diagnostics per symbol (updated every Evaluate call)
+	lastDiagBySymbol map[string]*Diagnostics
+}
+
+// moduleSpec is the configuration needed to (re)instantiate a scoring module.
+type moduleSpec struct {
+	name   string
+	weight float64
+	params map[string]interface{}
+}
+
+// symbolState holds all per-symbol runtime/mutable state: module instances
+// (each with independent internal history for crossover/momentum detection),
+// long position tracking, and virtual short position tracking.
+type symbolState struct {
+	weightedModules []weightedMod
+
+	// Signal confirmation / cooldown (long side)
+	confirmCount  int // consecutive bars above buy threshold
+	cooldownCount int
+
+	// Long position tracking
+	highWaterMark  float64
+	entryPrice     float64
+	barsSinceEntry int
+
 	// Short runtime state (virtual position for signal tracking)
 	shortConfirmCount   int
 	shortCooldownCount  int
@@ -93,9 +126,6 @@ type CustomWeightedStrategy struct {
 	shortEntryPrice     float64
 	shortLowWaterMark   float64 // lowest price since short entry (for trailing stop)
 	shortBarsSinceEntry int
-
-	// Last evaluation diagnostics per symbol (updated every Evaluate call)
-	lastDiagBySymbol map[string]*Diagnostics
 }
 
 // Diagnostics holds the latest strategy evaluation state for live monitoring.
@@ -178,6 +208,7 @@ func NewCustomWeightedStrategy() *CustomWeightedStrategy {
 		shortADXMin:      20,
 		shortADXDIFilter: true,
 
+		states:           make(map[string]*symbolState),
 		lastDiagBySymbol: make(map[string]*Diagnostics),
 	}
 }
@@ -192,20 +223,11 @@ func (s *CustomWeightedStrategy) Reconfigure(cfg map[string]interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Reset trading state
-	s.confirmCount = 0
-	s.cooldownCount = 0
-	s.barsSinceEntry = 0
-	s.highWaterMark = 0
-	s.entryPrice = 0
-	// Reset short state
-	s.shortConfirmCount = 0
-	s.shortCooldownCount = 0
-	s.inShortPosition = false
-	s.shortEntryPrice = 0
-	s.shortLowWaterMark = 0
-	s.shortBarsSinceEntry = 0
-	s.weightedModules = nil // Clear modules before re-init
+	// Reset all per-symbol trading state (module instances get rebuilt lazily
+	// from the new moduleSpecs on next Evaluate/OnTradeExecuted call).
+	s.states = make(map[string]*symbolState)
+	s.templateModules = nil // Clear modules before re-init
+	s.moduleSpecs = nil
 
 	return s.init(cfg)
 }
@@ -215,8 +237,8 @@ func (s *CustomWeightedStrategy) GetConfig() map[string]interface{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	mods := make([]map[string]interface{}, 0, len(s.weightedModules))
-	for _, wm := range s.weightedModules {
+	mods := make([]map[string]interface{}, 0, len(s.templateModules))
+	for _, wm := range s.templateModules {
 		mods = append(mods, map[string]interface{}{
 			"name":   wm.module.Name(),
 			"weight": wm.weight,
@@ -404,10 +426,11 @@ func (s *CustomWeightedStrategy) init(cfg map[string]interface{}) error {
 			return fmt.Errorf("unknown module: %s, available: %v", name, modules.Available())
 		}
 
-		s.weightedModules = append(s.weightedModules, weightedMod{module: mod, weight: weight})
+		s.templateModules = append(s.templateModules, weightedMod{module: mod, weight: weight})
+		s.moduleSpecs = append(s.moduleSpecs, moduleSpec{name: name, weight: weight, params: params})
 	}
 
-	if len(s.weightedModules) == 0 {
+	if len(s.templateModules) == 0 {
 		return fmt.Errorf("no valid modules configured")
 	}
 
@@ -429,7 +452,8 @@ func (s *CustomWeightedStrategy) initDefaultModules() error {
 
 	for _, d := range defaults {
 		mod, _ := modules.Create(d.name, nil)
-		s.weightedModules = append(s.weightedModules, weightedMod{module: mod, weight: d.weight})
+		s.templateModules = append(s.templateModules, weightedMod{module: mod, weight: d.weight})
+		s.moduleSpecs = append(s.moduleSpecs, moduleSpec{name: d.name, weight: d.weight, params: nil})
 	}
 	return nil
 }
@@ -463,7 +487,7 @@ func (s *CustomWeightedStrategy) RequiredIndicators() []strategy.IndicatorRequir
 		})
 	}
 
-	for _, wm := range s.weightedModules {
+	for _, wm := range s.templateModules {
 		for _, req := range wm.module.RequiredIndicators() {
 			key := req.Name + fmt.Sprintf("%v", req.Params)
 			if _, ok := seen[key]; ok {
@@ -475,6 +499,25 @@ func (s *CustomWeightedStrategy) RequiredIndicators() []strategy.IndicatorRequir
 	}
 
 	return result
+}
+
+// getOrCreateState returns the per-symbol runtime state, lazily creating a
+// fresh set of module instances (independent internal history) on first use.
+// Caller must hold s.mu (write lock).
+func (s *CustomWeightedStrategy) getOrCreateState(symbol string) *symbolState {
+	if st, ok := s.states[symbol]; ok {
+		return st
+	}
+	st := &symbolState{}
+	for _, spec := range s.moduleSpecs {
+		mod, ok := modules.Create(spec.name, spec.params)
+		if !ok {
+			continue
+		}
+		st.weightedModules = append(st.weightedModules, weightedMod{module: mod, weight: spec.weight})
+	}
+	s.states[symbol] = st
+	return st
 }
 
 // HTFIndicatorRequirements returns indicator requirements for the higher timeframe.
@@ -506,8 +549,10 @@ func (s *CustomWeightedStrategy) HTFHistoryRequired() int {
 }
 
 func (s *CustomWeightedStrategy) RequiredHistory() int {
-	maxHist := 60 // minimum reasonable
-	for _, wm := range s.weightedModules {
+	// Longest lookback actually needed by configured modules/filters, before
+	// accounting for indicator convergence (see below).
+	maxHist := 0
+	for _, wm := range s.templateModules {
 		if h := wm.module.RequiredHistory(); h > maxHist {
 			maxHist = h
 		}
@@ -516,12 +561,30 @@ func (s *CustomWeightedStrategy) RequiredHistory() int {
 	if s.trendFilterEnabled && s.trendPeriod+10 > maxHist {
 		maxHist = s.trendPeriod + 10
 	}
-	return maxHist + 10
+
+	// EMA/MACD/RSI/ATR/ADX use recursive (Wilder/exponential) smoothing,
+	// seeded via SMA at the start of whatever window is passed in — the
+	// seed's influence only decays to negligible after several multiples of
+	// the longest period involved. Backtest passes a fixed-size window while
+	// live's window grows over time, so without enough runway the two would
+	// compute different values for the same bar/timestamp. ~6x runway makes
+	// that residual negligible regardless of window length, so backtest and
+	// live converge to effectively the same indicator values.
+	warm := maxHist * 6
+	if warm < 60 {
+		warm = 60 // floor for very light configs (e.g. only MFI/CMF, which aren't seed-sensitive)
+	}
+	return warm + 10
 }
 
 func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.MarketSnapshot) (*strategy.Signal, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// Full lock, not RLock: this mutates per-symbol state (confirm/cooldown
+	// counters, entry price, high-water mark) and may lazily create a new
+	// symbolState entry in the map.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st := s.getOrCreateState(snap.Symbol)
 
 	sig := &strategy.Signal{
 		Action:     strategy.Hold,
@@ -538,7 +601,7 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 
 	moduleScores := make(map[string]float64)
 	moduleWeights := make(map[string]float64)
-	for _, wm := range s.weightedModules {
+	for _, wm := range st.weightedModules {
 		score := wm.module.Score(snap)
 		weighted := score * wm.weight
 		composite += weighted
@@ -609,27 +672,27 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 
 	// --- BUY LOGIC ---
 	if !hasPosition {
-		if s.cooldownCount > 0 {
-			holdReason = fmt.Sprintf("冷却期中，剩余 %d 根K线", s.cooldownCount)
-			s.cooldownCount--
+		if st.cooldownCount > 0 {
+			holdReason = fmt.Sprintf("冷却期中，剩余 %d 根K线", st.cooldownCount)
+			st.cooldownCount--
 		} else if !trendBullish {
 			holdReason = fmt.Sprintf("趋势过滤：价格低于EMA(%d)，距离 %.2f%%", s.trendPeriod, trendDist)
-			s.confirmCount = 0
+			st.confirmCount = 0
 		} else if !htfBullish {
 			holdReason = fmt.Sprintf("大周期过滤：HTF价格低于EMA(%d)，距离 %.2f%%", s.htfPeriod, htfDist)
-			s.confirmCount = 0
+			st.confirmCount = 0
 			htfBlocked = true
 			sig.Indicators["htf_blocked"] = 1.0
 		} else if s.emaCrossMin > 0 && moduleScores["ema_cross"] < s.emaCrossMin {
 			holdReason = fmt.Sprintf("EMA cross 分 %.3f 未达最低门槛 %.2f", moduleScores["ema_cross"], s.emaCrossMin)
-			s.confirmCount = 0
+			st.confirmCount = 0
 		} else if composite < s.effectiveBuyThreshold(htfDataOK, htfDist, moduleScores["ema_cross"]) {
 			effective := s.effectiveBuyThreshold(htfDataOK, htfDist, moduleScores["ema_cross"])
 			holdReason = fmt.Sprintf("综合评分 %.3f 未达动态买入阈值 %.2f（HTF距离 %.1f%%）", composite, effective, htfDist)
-			s.confirmCount = 0
+			st.confirmCount = 0
 		} else {
-			s.confirmCount++
-			if s.confirmCount >= s.confirmBars {
+			st.confirmCount++
+			if st.confirmCount >= s.confirmBars {
 				effective := s.effectiveBuyThreshold(htfDataOK, htfDist, moduleScores["ema_cross"])
 				htfLabel := "看空"
 				if htfBullish {
@@ -648,9 +711,20 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 					"Custom buy (score=%.2f, threshold=%.2f, htf=%s(%.1f%%)): %s%s",
 					composite, effective, htfLabel, htfDist, strings.Join(scoreParts, ", "), caution,
 				)
-				s.confirmCount = 0
+				st.confirmCount = 0
+
+				// 多空冲突：新的做多信号优先，强制平掉虚拟空头仓位（做空本身是纯告警/
+				// 虚拟持仓，没有真实订单，所以这里只需重置内部状态，不需要下单）。
+				if st.inShortPosition {
+					sig.Reason += "（做多信号触发，已平掉虚拟空头仓位）"
+					st.inShortPosition = false
+					st.shortEntryPrice = 0
+					st.shortLowWaterMark = 0
+					st.shortBarsSinceEntry = 0
+					st.shortCooldownCount = s.shortCooldownBars
+				}
 			} else {
-				holdReason = fmt.Sprintf("确认中 %d/%d 根K线（评分 %.3f 已达阈值 %.2f）", s.confirmCount, s.confirmBars, composite, s.buyThreshold)
+				holdReason = fmt.Sprintf("确认中 %d/%d 根K线（评分 %.3f 已达阈值 %.2f）", st.confirmCount, s.confirmBars, composite, s.buyThreshold)
 			}
 		}
 	}
@@ -659,53 +733,53 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 	if hasPosition {
 		// 恢复 entryPrice：程序重启后策略内部状态丢失,
 		// 但 snap.Position.AvgEntryPrice 从仓位管理器恢复了。
-		if s.entryPrice <= 0 && snap.Position.AvgEntryPrice > 0 {
-			s.entryPrice = snap.Position.AvgEntryPrice
+		if st.entryPrice <= 0 && snap.Position.AvgEntryPrice > 0 {
+			st.entryPrice = snap.Position.AvgEntryPrice
 		}
 		// 如果 highWaterMark 也未初始化，用 entryPrice 兜底
-		if s.highWaterMark <= 0 && s.entryPrice > 0 {
-			s.highWaterMark = s.entryPrice
+		if st.highWaterMark <= 0 && st.entryPrice > 0 {
+			st.highWaterMark = st.entryPrice
 		}
 
-		s.barsSinceEntry++
+		st.barsSinceEntry++
 
 		// 用K线最高价追踪(而非收盘价),确保捕捉到盘中最高点
-		if klineHigh > s.highWaterMark {
-			s.highWaterMark = klineHigh
+		if klineHigh > st.highWaterMark {
+			st.highWaterMark = klineHigh
 		}
 
 		// 硬止损价（ATR 激活前的兜底，0=禁用）
-		if s.hardStopPct > 0 && s.entryPrice > 0 {
-			hardStopPrice = s.entryPrice * (1 - s.hardStopPct/100)
+		if s.hardStopPct > 0 && st.entryPrice > 0 {
+			hardStopPrice = st.entryPrice * (1 - s.hardStopPct/100)
 		}
 
 		// 当前浮盈百分比，决定是否激活 ATR trailing
 		currentProfitPct := 0.0
-		if s.entryPrice > 0 && closePrice > 0 {
-			currentProfitPct = (closePrice - s.entryPrice) / s.entryPrice * 100
+		if st.entryPrice > 0 && closePrice > 0 {
+			currentProfitPct = (closePrice - st.entryPrice) / st.entryPrice * 100
 		}
 		atrTrailingActive := s.atrActivateProfitPct == 0 || currentProfitPct >= s.atrActivateProfitPct
 
 		// 始终计算 ATR 止损价（用于前端展示），但仅在激活时触发出场
-		if atr > 0 && s.highWaterMark > 0 {
+		if atr > 0 && st.highWaterMark > 0 {
 			mult := s.atrStopMult
-			if s.entryPrice > 0 {
-				profitPct := (s.highWaterMark - s.entryPrice) / s.entryPrice * 100
+			if st.entryPrice > 0 {
+				profitPct := (st.highWaterMark - st.entryPrice) / st.entryPrice * 100
 				if profitPct > 30 {
 					mult *= 0.65
 				} else if profitPct > 15 {
 					mult *= 0.8
 				}
 			}
-			stopPrice = s.highWaterMark - atr*mult
+			stopPrice = st.highWaterMark - atr*mult
 		}
 
-		if s.minHoldBars > 0 && s.barsSinceEntry < s.minHoldBars {
+		if s.minHoldBars > 0 && st.barsSinceEntry < s.minHoldBars {
 			effectiveStop := stopPrice
 			if !atrTrailingActive && hardStopPrice > 0 {
 				effectiveStop = hardStopPrice
 			}
-			holdReason = fmt.Sprintf("最短持仓期中 %d/%d 根K线（止损价=%.2f）", s.barsSinceEntry, s.minHoldBars, effectiveStop)
+			holdReason = fmt.Sprintf("最短持仓期中 %d/%d 根K线（止损价=%.2f）", st.barsSinceEntry, s.minHoldBars, effectiveStop)
 		} else {
 			// Sell condition 1: 硬止损（持仓锁结束后的绝对兜底）
 			if hardStopPrice > 0 && closePrice <= hardStopPrice {
@@ -713,7 +787,7 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 				sig.Strength = 1.0
 				sig.Reason = fmt.Sprintf(
 					"Hard stop: price=%.2f below entry*%.1f%%=%.2f (entry=%.2f)",
-					closePrice, s.hardStopPct, hardStopPrice, s.entryPrice,
+					closePrice, s.hardStopPct, hardStopPrice, st.entryPrice,
 				)
 			}
 
@@ -723,7 +797,7 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 				sig.Strength = 0.8
 				sig.Reason = fmt.Sprintf(
 					"ATR trailing stop: price=%.2f below stop=%.2f (high=%.2f, ATR=%.2f×%.1f)",
-					closePrice, stopPrice, s.highWaterMark, atr, s.atrStopMult,
+					closePrice, stopPrice, st.highWaterMark, atr, s.atrStopMult,
 				)
 			}
 
@@ -751,14 +825,25 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 					effectiveStop = hardStopPrice
 				}
 				holdReason = fmt.Sprintf("持仓中 %d 根K线，止损价=%.2f（当前=%.2f），评分=%.3f 未触发卖出阈值 %.2f%s",
-					s.barsSinceEntry, effectiveStop, closePrice, composite, s.sellThreshold, activeMark)
+					st.barsSinceEntry, effectiveStop, closePrice, composite, s.sellThreshold, activeMark)
 			}
 		}
 	}
 
 	// --- SHORT LOGIC (independent of long, evaluated when long action is Hold) ---
 	if s.shortEnabled && sig.Action == strategy.Hold {
-		sig = s.evaluateShort(sig, composite, scoreParts, closePrice, atr, trendBullish, htfBullish, snap.Indicators.ADX)
+		sig = s.evaluateShort(st, sig, composite, scoreParts, closePrice, atr, trendBullish, htfBullish, snap.Indicators.ADX)
+
+		// 多空冲突：已持有真实多头仓位时，不能再叠加一个虚拟空头（现货也没法真实做空）。
+		// 新的做空信号优先 —— 强制转为真实平多单，而不是同时挂着多空两头仓位。
+		// 空头本身仍是"仅告警"：这里只是把这一根K线的动作从 Short 改成 Sell，
+		// 并没有调用 OnShortSignalProcessed，所以虚拟空头状态不会被标记为已开仓。
+		if sig.Action == strategy.Short && hasPosition {
+			shortReason := sig.Reason
+			sig.Action = strategy.Sell
+			sig.Strength = 1.0
+			sig.Reason = fmt.Sprintf("多空冲突：做空信号触发，强制平多仓（原做空信号: %s）", shortReason)
+		}
 	}
 
 	// --- Save diagnostics ---
@@ -772,12 +857,12 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 		BuyThreshold:   s.buyThreshold,
 		SellThreshold:  s.sellThreshold,
 		HasPosition:    hasPosition,
-		EntryPrice:     s.entryPrice,
-		HighWaterMark:  s.highWaterMark,
-		BarsSinceEntry: s.barsSinceEntry,
-		ConfirmCount:   s.confirmCount,
+		EntryPrice:     st.entryPrice,
+		HighWaterMark:  st.highWaterMark,
+		BarsSinceEntry: st.barsSinceEntry,
+		ConfirmCount:   st.confirmCount,
 		ConfirmBars:    s.confirmBars,
-		CooldownCount:  s.cooldownCount,
+		CooldownCount:  st.cooldownCount,
 		CooldownBars:   s.cooldownBars,
 		MinHoldBars:    s.minHoldBars,
 		TrendFilterOn:  s.trendFilterEnabled,
@@ -802,34 +887,34 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 // evaluateShort handles virtual short position management and signal generation.
 // Short entry: composite deeply negative + bearish trend confirmation.
 // Short exit: composite turns positive OR ATR trailing stop (inverted).
-func (s *CustomWeightedStrategy) evaluateShort(sig *strategy.Signal, composite float64, scoreParts []string, closePrice, atr float64, trendBullish, htfBullish bool, adx strategy.ADXValue) *strategy.Signal {
-	if s.inShortPosition {
-		s.shortBarsSinceEntry++
+func (s *CustomWeightedStrategy) evaluateShort(st *symbolState, sig *strategy.Signal, composite float64, scoreParts []string, closePrice, atr float64, trendBullish, htfBullish bool, adx strategy.ADXValue) *strategy.Signal {
+	if st.inShortPosition {
+		st.shortBarsSinceEntry++
 
 		// Track low water mark (lowest price since entry)
-		if closePrice < s.shortLowWaterMark || s.shortLowWaterMark == 0 {
-			s.shortLowWaterMark = closePrice
+		if closePrice < st.shortLowWaterMark || st.shortLowWaterMark == 0 {
+			st.shortLowWaterMark = closePrice
 		}
 
 		// Min hold period
-		if s.shortMinHoldBars > 0 && s.shortBarsSinceEntry < s.shortMinHoldBars {
+		if s.shortMinHoldBars > 0 && st.shortBarsSinceEntry < s.shortMinHoldBars {
 			return sig
 		}
 
 		// Cover condition 1: ATR trailing stop (inverted — price rises above low + ATR*mult)
 		// Optimization: only activate ATR stop after position has reached minimum profit
 		atrStopActive := true
-		if s.shortATRStopActivatePct > 0 && s.shortEntryPrice > 0 {
-			currentProfitPct := (s.shortEntryPrice - s.shortLowWaterMark) / s.shortEntryPrice * 100
+		if s.shortATRStopActivatePct > 0 && st.shortEntryPrice > 0 {
+			currentProfitPct := (st.shortEntryPrice - st.shortLowWaterMark) / st.shortEntryPrice * 100
 			atrStopActive = currentProfitPct >= s.shortATRStopActivatePct
 		}
 
-		if atrStopActive && atr > 0 && s.shortLowWaterMark > 0 && s.shortATRStopMult > 0 {
+		if atrStopActive && atr > 0 && st.shortLowWaterMark > 0 && s.shortATRStopMult > 0 {
 			mult := s.shortATRStopMult
 
 			// Profit-based tightening for shorts
-			if s.shortEntryPrice > 0 {
-				profitPct := (s.shortEntryPrice - s.shortLowWaterMark) / s.shortEntryPrice * 100
+			if st.shortEntryPrice > 0 {
+				profitPct := (st.shortEntryPrice - st.shortLowWaterMark) / st.shortEntryPrice * 100
 				if profitPct > 30 {
 					mult *= 0.65
 				} else if profitPct > 15 {
@@ -837,13 +922,13 @@ func (s *CustomWeightedStrategy) evaluateShort(sig *strategy.Signal, composite f
 				}
 			}
 
-			stopPrice := s.shortLowWaterMark + atr*mult
+			stopPrice := st.shortLowWaterMark + atr*mult
 			if closePrice >= stopPrice {
 				sig.Action = strategy.Cover
 				sig.Strength = 0.8
 				sig.Reason = fmt.Sprintf(
 					"Short ATR trailing stop: price=%.2f above stop=%.2f (low=%.2f, ATR=%.2f×%.1f)",
-					closePrice, stopPrice, s.shortLowWaterMark, atr, mult,
+					closePrice, stopPrice, st.shortLowWaterMark, atr, mult,
 				)
 				return sig
 			}
@@ -863,20 +948,20 @@ func (s *CustomWeightedStrategy) evaluateShort(sig *strategy.Signal, composite f
 		// Not in short position — check for short entry
 
 		// Short cooldown
-		if s.shortCooldownCount > 0 {
-			s.shortCooldownCount--
+		if st.shortCooldownCount > 0 {
+			st.shortCooldownCount--
 			return sig
 		}
 
 		// Trend filter: only short when trend is BEARISH (price below EMA)
 		if s.trendFilterEnabled && trendBullish {
-			s.shortConfirmCount = 0
+			st.shortConfirmCount = 0
 			return sig
 		}
 
 		// HTF filter: only short when higher TF is BEARISH
 		if s.htfEnabled && htfBullish {
-			s.shortConfirmCount = 0
+			st.shortConfirmCount = 0
 			return sig
 		}
 
@@ -884,12 +969,12 @@ func (s *CustomWeightedStrategy) evaluateShort(sig *strategy.Signal, composite f
 		if s.shortADXEnabled && adx.Period > 0 {
 			// ADX too low = no trend (sideways market) → don't short
 			if adx.ADX < s.shortADXMin {
-				s.shortConfirmCount = 0
+				st.shortConfirmCount = 0
 				return sig
 			}
 			// DI filter: only short when -DI > +DI (bearish directional movement)
 			if s.shortADXDIFilter && adx.MinusDI <= adx.PlusDI {
-				s.shortConfirmCount = 0
+				st.shortConfirmCount = 0
 				return sig
 			}
 		}
@@ -898,7 +983,7 @@ func (s *CustomWeightedStrategy) evaluateShort(sig *strategy.Signal, composite f
 		if s.shortATRVolatilityMin > 0 && closePrice > 0 && atr > 0 {
 			atrPct := atr / closePrice * 100
 			if atrPct < s.shortATRVolatilityMin {
-				s.shortConfirmCount = 0
+				st.shortConfirmCount = 0
 				return sig
 			}
 		}
@@ -910,82 +995,86 @@ func (s *CustomWeightedStrategy) evaluateShort(sig *strategy.Signal, composite f
 				// Score crossed threshold but too weak — don't count
 				return sig
 			}
-			s.shortConfirmCount++
+			st.shortConfirmCount++
 		} else {
-			s.shortConfirmCount = 0
+			st.shortConfirmCount = 0
 		}
 
-		if s.shortConfirmCount >= s.shortConfirmBars {
+		if st.shortConfirmCount >= s.shortConfirmBars {
 			sig.Action = strategy.Short
 			sig.Strength = clamp(-composite, 0.1, 1.0)
 			sig.Reason = fmt.Sprintf(
 				"Short entry (score=%.2f, threshold=%.2f): %s",
 				composite, s.shortThreshold, strings.Join(scoreParts, ", "),
 			)
-			s.shortConfirmCount = 0
+			st.shortConfirmCount = 0
 		}
 	}
 
 	return sig
 }
 
-// OnShortSignalProcessed updates virtual short position state.
-// Called by both backtest engine and live trader when a short signal is processed.
-func (s *CustomWeightedStrategy) OnShortSignalProcessed(action strategy.Action, price float64) {
+// OnShortSignalProcessed updates virtual short position state for the given
+// symbol. Called by both backtest engine and live trader when a short signal
+// is processed.
+func (s *CustomWeightedStrategy) OnShortSignalProcessed(symbol string, action strategy.Action, price float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	st := s.getOrCreateState(symbol)
 
 	switch action {
 	case strategy.Short:
-		s.inShortPosition = true
-		s.shortEntryPrice = price
-		s.shortLowWaterMark = price
-		s.shortBarsSinceEntry = 0
-		s.shortConfirmCount = 0
+		st.inShortPosition = true
+		st.shortEntryPrice = price
+		st.shortLowWaterMark = price
+		st.shortBarsSinceEntry = 0
+		st.shortConfirmCount = 0
 	case strategy.Cover:
-		s.inShortPosition = false
-		s.shortEntryPrice = 0
-		s.shortLowWaterMark = 0
-		s.shortBarsSinceEntry = 0
-		s.shortCooldownCount = s.shortCooldownBars
+		st.inShortPosition = false
+		st.shortEntryPrice = 0
+		st.shortLowWaterMark = 0
+		st.shortBarsSinceEntry = 0
+		st.shortCooldownCount = s.shortCooldownBars
 	}
 }
 
 func (s *CustomWeightedStrategy) OnTradeExecuted(trade *exchange.Trade) {
 	// Lock (write) — runs on the order manager goroutine, racing with Evaluate
-	// which holds RLock on the same mutex.
+	// which holds the same mutex.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	st := s.getOrCreateState(trade.Symbol)
 
 	if trade.Side == exchange.OrderSideBuy {
-		s.entryPrice = trade.Price
-		s.highWaterMark = trade.Price
-		s.confirmCount = 0
+		st.entryPrice = trade.Price
+		st.highWaterMark = trade.Price
+		st.confirmCount = 0
 		// 如果 trade.Timestamp 不是当前时间(重启恢复场景),根据时间差估算已过的 bars 数。
 		// 正常下单时 Timestamp ≈ now, elapsed ≈ 0, barsSinceEntry = 0。
 		// 重启恢复时 Timestamp = 真实入场时间, elapsed = 已过时长, 恢复正确的 bars。
 		elapsed := time.Since(trade.Timestamp)
 		if elapsed > 2*time.Minute && s.barDuration() > 0 {
-			s.barsSinceEntry = int(elapsed / s.barDuration())
+			st.barsSinceEntry = int(elapsed / s.barDuration())
 		} else {
-			s.barsSinceEntry = 0
+			st.barsSinceEntry = 0
 		}
 	} else {
-		s.entryPrice = 0
-		s.highWaterMark = 0
-		s.barsSinceEntry = 0
-		s.cooldownCount = s.cooldownBars // start cooldown
+		st.entryPrice = 0
+		st.highWaterMark = 0
+		st.barsSinceEntry = 0
+		st.cooldownCount = s.cooldownBars // start cooldown
 	}
 }
 
-// SetHighWaterMark overrides the tracked highest price since entry.
-// Used on startup to recover the real high from DB klines, since
-// OnTradeExecuted only sets highWaterMark = entryPrice.
-func (s *CustomWeightedStrategy) SetHighWaterMark(price float64) {
+// SetHighWaterMark overrides the tracked highest price since entry for the
+// given symbol. Used on startup to recover the real high from DB klines,
+// since OnTradeExecuted only sets highWaterMark = entryPrice.
+func (s *CustomWeightedStrategy) SetHighWaterMark(symbol string, price float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if price > s.highWaterMark {
-		s.highWaterMark = price
+	st := s.getOrCreateState(symbol)
+	if price > st.highWaterMark {
+		st.highWaterMark = price
 	}
 }
 

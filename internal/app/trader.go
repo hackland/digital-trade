@@ -41,6 +41,7 @@ type Trader struct {
 	override *override.Manager
 	strat    strategy.Strategy
 	indComp  *market.IndicatorComputer
+	vledger  *VirtualLedger
 }
 
 // NewTrader creates and initializes all components.
@@ -96,6 +97,11 @@ func NewTrader(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*Tr
 	// Indicator computer
 	indComp := market.NewIndicatorComputer()
 
+	// Virtual ledger: tracks hypothetical P&L for alert-only signals (short
+	// Short/Cover, or Buy/Sell blocked by signal_only). Alloc% mirrors the
+	// live risk config's real position sizing so the numbers are comparable.
+	vledger := NewVirtualLedger(store, cfg.Risk.AllocPct, logger.Named("vledger"))
+
 	return &Trader{
 		cfg:      cfg,
 		logger:   logger,
@@ -108,6 +114,7 @@ func NewTrader(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*Tr
 		override: overrideMgr,
 		strat:    strat,
 		indComp:  indComp,
+		vledger:  vledger,
 	}, nil
 }
 
@@ -203,8 +210,8 @@ func (t *Trader) Run(ctx context.Context) error {
 									maxHigh = k.High
 								}
 							}
-							if hwSetter, ok := t.strat.(interface{ SetHighWaterMark(float64) }); ok {
-								hwSetter.SetHighWaterMark(maxHigh)
+							if hwSetter, ok := t.strat.(interface{ SetHighWaterMark(string, float64) }); ok {
+								hwSetter.SetHighWaterMark(sym, maxHigh)
 							}
 							t.logger.Info("position state recovered from trades table",
 								zap.String("symbol", sym),
@@ -240,6 +247,10 @@ func (t *Trader) Run(ctx context.Context) error {
 		t.logger.Warn("no API key configured, skipping account initialization")
 		t.risk.SetEquity(10000) // 模拟初始资金
 	}
+
+	// Recover virtual ledger state (equity + any open virtual position) from
+	// the virtual_trades table so alert-only P&L tracking survives restart.
+	t.vledger.Recover(ctx, t.cfg.Exchange.Symbols)
 
 	// Load exchange symbol info (stepSize, minQty, etc.) for order precision
 	if err := t.order.LoadSymbolInfo(ctx); err != nil {
@@ -300,15 +311,16 @@ func (t *Trader) Run(ctx context.Context) error {
 	// Dashboard server
 	if t.cfg.Dashboard.Enabled {
 		deps := &handler.Deps{
-			Config:   t.cfg,
-			Bus:      t.bus,
-			Store:    t.store,
-			Exchange: t.exchange,
-			Position: t.position,
-			Risk:     t.risk,
-			Order:    t.order,
-			Override: t.override,
-			Strategy: t.strat,
+			Config:        t.cfg,
+			Bus:           t.bus,
+			Store:         t.store,
+			Exchange:      t.exchange,
+			Position:      t.position,
+			Risk:          t.risk,
+			Order:         t.order,
+			Override:      t.override,
+			Strategy:      t.strat,
+			VirtualLedger: t.vledger,
 		}
 		dashServer := web.NewServer(deps, t.logger.Named("dashboard"))
 
@@ -675,7 +687,52 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 					zap.String("reason", sig.Reason),
 				)
 
-				// Publish signal event
+				// Price for virtual-ledger accounting: the close of the bar that produced this signal.
+				price := float64(0)
+				if len(snapshot.Klines) > 0 {
+					price = snapshot.Klines[len(snapshot.Klines)-1].Close
+				}
+
+				// vres is populated below for alert-only OPEN/CLOSE legs (short
+				// Short/Cover, or a Buy blocked by signal_only) and threaded into
+				// the published SignalEvent's Metadata so Telegram/dashboard
+				// consumers can surface the hypothetical PnL/running equity.
+				var vres *VirtualFillResult
+
+				// Execute order or alert
+				if sig.Action.IsShort() {
+					// Short/Cover: alert only — publish event (→ Telegram) but do NOT place orders
+					// Update strategy's virtual short state
+					if shortHandler, ok := t.strat.(interface {
+						OnShortSignalProcessed(string, strategy.Action, float64)
+					}); ok {
+						shortHandler.OnShortSignalProcessed(sig.Symbol, sig.Action, price)
+					}
+					// Track hypothetical P&L for this alert-only short leg (survives restart).
+					vres = t.vledger.OnAlertOnlySignal(ctx, sig, price)
+					t.store.SaveSignal(ctx, sig, false)
+				} else if t.cfg.App.Mode == "live" && (sig.Action == strategy.Sell || !t.effectiveSignalOnly()) {
+					// Sell always executes when live, regardless of signal_only/trading_window —
+					// those gate new entries, not exits. A position must always be closeable.
+					if err := t.order.ProcessSignal(ctx, sig); err != nil {
+						t.logger.Error("process signal", zap.Error(err))
+					}
+				} else if t.cfg.App.Mode == "live" && sig.Action == strategy.Buy && t.effectiveSignalOnly() {
+					// Buy blocked by signal_only: no real order placed. Track hypothetical
+					// long P&L so the alert-only signal stream still accumulates a virtual
+					// equity curve (survives restart via virtual_trades).
+					vres = t.vledger.OnAlertOnlySignal(ctx, sig, price)
+					t.store.SaveSignal(ctx, sig, false)
+				} else {
+					// Paper mode: no real/virtual order simulation exists for this path today.
+					// Just log and persist the signal (unchanged prior behavior).
+					t.store.SaveSignal(ctx, sig, false)
+				}
+
+				logVirtualLedgerResult(t.logger, vres)
+
+				// Publish signal event, including virtual-ledger PnL/equity in
+				// Metadata when this signal was an alert-only open/close leg.
 				t.bus.Publish(eventbus.Event{
 					Type:      eventbus.EventSignal,
 					Timestamp: time.Now(),
@@ -685,58 +742,9 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 						Strength: sig.Strength,
 						Strategy: sig.Strategy,
 						Reason:   sig.Reason,
+						Metadata: virtualFillMetadata(vres),
 					},
 				})
-
-				// Execute order or alert
-				if sig.Action.IsShort() {
-					// Short/Cover: alert only — publish event (→ Telegram) but do NOT place orders
-					// Update strategy's virtual short state
-					if shortHandler, ok := t.strat.(interface {
-						OnShortSignalProcessed(strategy.Action, float64)
-					}); ok {
-						price := float64(0)
-						if len(snapshot.Klines) > 0 {
-							price = snapshot.Klines[len(snapshot.Klines)-1].Close
-						}
-						shortHandler.OnShortSignalProcessed(sig.Action, price)
-					}
-					t.store.SaveSignal(ctx, sig, false)
-				} else if t.cfg.App.Mode == "live" && ((sig.Action == strategy.Sell && pos.Quantity > 0) || !t.effectiveSignalOnly()) {
-					// Sell always executes when live and there's a real position to close,
-					// regardless of signal_only/trading_window — those gate new entries, not
-					// exits. If pos.Quantity is 0 the "position" is only the virtual one
-					// tracked for signal-only alerts (see the branch below), so there is
-					// nothing real to sell — fall through to the virtual-fill path instead.
-					if err := t.order.ProcessSignal(ctx, sig); err != nil {
-						t.logger.Error("process signal", zap.Error(err))
-					}
-				} else {
-					// Paper mode, or a buy blocked by signal_only: no real order, but still
-					// feed the strategy a virtual fill so entryPrice/highWaterMark/cooldown
-					// track exactly like a real (or backtest) position. Without this, the
-					// strategy never leaves its "flat" state under signal_only, so it just
-					// re-fires a BUY alert on every bar the score clears the threshold
-					// instead of respecting cooldown/min_hold like the backtest does.
-					if sig.Action == strategy.Buy || sig.Action == strategy.Sell {
-						price := float64(0)
-						if len(snapshot.Klines) > 0 {
-							price = snapshot.Klines[len(snapshot.Klines)-1].Close
-						}
-						side := exchange.OrderSideBuy
-						if sig.Action == strategy.Sell {
-							side = exchange.OrderSideSell
-						}
-						t.strat.OnTradeExecuted(&exchange.Trade{
-							Symbol:    sig.Symbol,
-							Side:      side,
-							Price:     price,
-							Quantity:  1, // virtual fill: only entryPrice/cooldown state matters, not size
-							Timestamp: time.Now(),
-						})
-					}
-					t.store.SaveSignal(ctx, sig, false)
-				}
 			}
 		}
 	}
