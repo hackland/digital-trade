@@ -549,7 +549,9 @@ func (s *CustomWeightedStrategy) HTFHistoryRequired() int {
 }
 
 func (s *CustomWeightedStrategy) RequiredHistory() int {
-	maxHist := 60 // minimum reasonable
+	// Longest lookback actually needed by configured modules/filters, before
+	// accounting for indicator convergence (see below).
+	maxHist := 0
 	for _, wm := range s.templateModules {
 		if h := wm.module.RequiredHistory(); h > maxHist {
 			maxHist = h
@@ -559,7 +561,20 @@ func (s *CustomWeightedStrategy) RequiredHistory() int {
 	if s.trendFilterEnabled && s.trendPeriod+10 > maxHist {
 		maxHist = s.trendPeriod + 10
 	}
-	return maxHist + 10
+
+	// EMA/MACD/RSI/ATR/ADX use recursive (Wilder/exponential) smoothing,
+	// seeded via SMA at the start of whatever window is passed in — the
+	// seed's influence only decays to negligible after several multiples of
+	// the longest period involved. Backtest passes a fixed-size window while
+	// live's window grows over time, so without enough runway the two would
+	// compute different values for the same bar/timestamp. ~6x runway makes
+	// that residual negligible regardless of window length, so backtest and
+	// live converge to effectively the same indicator values.
+	warm := maxHist * 6
+	if warm < 60 {
+		warm = 60 // floor for very light configs (e.g. only MFI/CMF, which aren't seed-sensitive)
+	}
+	return warm + 10
 }
 
 func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.MarketSnapshot) (*strategy.Signal, error) {
@@ -692,6 +707,17 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 					composite, effective, htfLabel, htfDist, strings.Join(scoreParts, ", "), caution,
 				)
 				st.confirmCount = 0
+
+				// 多空冲突：新的做多信号优先，强制平掉虚拟空头仓位（做空本身是纯告警/
+				// 虚拟持仓，没有真实订单，所以这里只需重置内部状态，不需要下单）。
+				if st.inShortPosition {
+					sig.Reason += "（做多信号触发，已平掉虚拟空头仓位）"
+					st.inShortPosition = false
+					st.shortEntryPrice = 0
+					st.shortLowWaterMark = 0
+					st.shortBarsSinceEntry = 0
+					st.shortCooldownCount = s.shortCooldownBars
+				}
 			} else {
 				holdReason = fmt.Sprintf("确认中 %d/%d 根K线（评分 %.3f 已达阈值 %.2f）", st.confirmCount, s.confirmBars, composite, s.buyThreshold)
 			}
@@ -802,6 +828,17 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 	// --- SHORT LOGIC (independent of long, evaluated when long action is Hold) ---
 	if s.shortEnabled && sig.Action == strategy.Hold {
 		sig = s.evaluateShort(st, sig, composite, scoreParts, closePrice, atr, trendBullish, htfBullish, snap.Indicators.ADX)
+
+		// 多空冲突：已持有真实多头仓位时，不能再叠加一个虚拟空头（现货也没法真实做空）。
+		// 新的做空信号优先 —— 强制转为真实平多单，而不是同时挂着多空两头仓位。
+		// 空头本身仍是"仅告警"：这里只是把这一根K线的动作从 Short 改成 Sell，
+		// 并没有调用 OnShortSignalProcessed，所以虚拟空头状态不会被标记为已开仓。
+		if sig.Action == strategy.Short && hasPosition {
+			shortReason := sig.Reason
+			sig.Action = strategy.Sell
+			sig.Strength = 1.0
+			sig.Reason = fmt.Sprintf("多空冲突：做空信号触发，强制平多仓（原做空信号: %s）", shortReason)
+		}
 	}
 
 	// --- Save diagnostics ---

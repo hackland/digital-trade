@@ -15,15 +15,31 @@ import (
 
 // Deps holds all dependencies the dashboard needs from the trader.
 type Deps struct {
-	Config   *config.Config
-	Bus      *eventbus.Bus
-	Store    storage.Store
-	Exchange exchange.Exchange
-	Position *position.Manager
-	Risk     *risk.Manager
-	Order    *order.Manager
-	Override *override.Manager
-	Strategy strategy.Strategy
+	Config        *config.Config
+	Bus           *eventbus.Bus
+	Store         storage.Store
+	Exchange      exchange.Exchange
+	Position      *position.Manager
+	Risk          *risk.Manager
+	Order         *order.Manager
+	Override      *override.Manager
+	Strategy      strategy.Strategy
+	VirtualLedger VirtualLedgerReader
+}
+
+// VirtualLedgerReader is the minimal read interface the dashboard needs from
+// internal/app.VirtualLedger, kept here (rather than importing internal/app
+// directly) to avoid a web -> app dependency cycle (app already imports web).
+type VirtualLedgerReader interface {
+	Snapshot(symbol string) map[string]VirtualLedgerSnapshotView
+}
+
+// VirtualLedgerSnapshotView mirrors app.VirtualLedgerSnapshot's shape.
+type VirtualLedgerSnapshotView struct {
+	Equity     float64 `json:"equity"`
+	InPosition bool    `json:"in_position"`
+	EntryPrice float64 `json:"entry_price,omitempty"`
+	Quantity   float64 `json:"quantity,omitempty"`
 }
 
 // Handler holds all REST API handler methods.

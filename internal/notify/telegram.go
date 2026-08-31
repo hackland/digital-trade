@@ -119,6 +119,7 @@ func (n *TelegramNotifier) handleSignal(ctx context.Context, evt eventbus.Event)
 
 	msg := fmt.Sprintf("%s *%s*\n币对: `%s`\n强度: `%.2f`\n策略: %s\n原因: %s",
 		emoji, label, sig.Symbol, sig.Strength, sig.Strategy, sig.Reason)
+	msg += virtualLedgerSuffix(sig.Metadata)
 	n.send(ctx, msg)
 }
 
@@ -217,6 +218,26 @@ func (n *TelegramNotifier) sendOnce(ctx context.Context, text, parseMode string)
 		return false
 	}
 	return true
+}
+
+// virtualLedgerSuffix renders the virtual-ledger fields set in
+// eventbus.SignalEvent.Metadata (see internal/app/virtual_ledger.go
+// virtualFillMetadata) as an appendix to the alert text, so alert-only
+// signals (short Short/Cover, or a Buy blocked by signal_only) show what
+// the hypothetical trade would have done. Returns "" when metadata carries
+// no virtual-ledger fields (e.g. real-order signals).
+func virtualLedgerSuffix(md map[string]float64) string {
+	if len(md) == 0 {
+		return ""
+	}
+	if _, closed := md["virtual_closed"]; closed {
+		return fmt.Sprintf("\n虚拟平仓: 入场=`%.2f` 出场=`%.2f` 盈亏=`%.2f%%` (`%.2f USDT`)\n虚拟权益: `%.2f`",
+			md["virtual_entry_price"], md["virtual_exit_price"], md["virtual_pnl_pct"], md["virtual_pnl_usdt"], md["virtual_equity"])
+	}
+	if _, opened := md["virtual_opened"]; opened {
+		return fmt.Sprintf("\n虚拟开仓: 入场=`%.2f`\n虚拟权益: `%.2f`", md["virtual_entry_price"], md["virtual_equity"])
+	}
+	return ""
 }
 
 // stripMarkdown removes Telegram Markdown emphasis characters so the text

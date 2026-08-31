@@ -10,8 +10,8 @@
     },
     {
       "name": "frontend",
-      "runtimeExecutable": "pnpm",
-      "runtimeArgs": ["dev"],
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-c", "cd web/dashboard && pnpm dev"],
       "port": 5199,
       "autoPort": false
     }

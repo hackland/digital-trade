@@ -44,6 +44,17 @@ type SignalRepository interface {
 	GetSignals(ctx context.Context, filter SignalFilter) ([]SignalRecord, error)
 }
 
+// VirtualTradeRepository persists virtual (alert-only) trade legs so the
+// hypothetical P&L for signals that never place a real order (Short/Cover,
+// or Buy/Sell blocked by signal_only) can be tracked and survives restarts.
+type VirtualTradeRepository interface {
+	SaveVirtualTrade(ctx context.Context, trade *VirtualTradeRecord) error
+	GetVirtualTrades(ctx context.Context, filter VirtualTradeFilter) ([]VirtualTradeRecord, error)
+	// GetLatestVirtualTrade returns the single most recent virtual trade leg
+	// for an exact symbol+side (e.g. side="SHORT"), or nil, nil if none exist.
+	GetLatestVirtualTrade(ctx context.Context, symbol, side string) (*VirtualTradeRecord, error)
+}
+
 // Store combines all repositories.
 type Store interface {
 	KlineRepository
@@ -51,6 +62,7 @@ type Store interface {
 	OrderRepository
 	SnapshotRepository
 	SignalRepository
+	VirtualTradeRepository
 	Close() error
 	Migrate(ctx context.Context) error
 }
@@ -116,6 +128,26 @@ type SignalRecord struct {
 	WasExecuted  bool               `json:"was_executed"`
 }
 
+// VirtualTradeRecord is a single leg (open or close) of a virtually tracked
+// trade — i.e. one that was never actually placed on the exchange because
+// the signal was alert-only (Short/Cover, or a Buy/Sell blocked by
+// app.signal_only). Side is the direction of the leg itself: BUY/SHORT for
+// an open, SELL/COVER for the matching close. PnL and EquityAfter are only
+// populated on close legs.
+type VirtualTradeRecord struct {
+	ID           int64     `json:"id"`
+	Symbol       string    `json:"symbol"`
+	Side         string    `json:"side"` // BUY | SELL | SHORT | COVER
+	Price        float64   `json:"price"`
+	Quantity     float64   `json:"quantity"`
+	Fee          float64   `json:"fee"`
+	PnL          *float64  `json:"pnl"`          // nil unless this leg closes a position
+	EquityAfter  *float64  `json:"equity_after"` // nil unless this leg closes a position
+	Reason       string    `json:"reason"`
+	StrategyName string    `json:"strategy_name"`
+	Timestamp    time.Time `json:"timestamp"`
+}
+
 // --- Filters ---
 
 type TradeFilter struct {
@@ -144,4 +176,13 @@ type SignalFilter struct {
 	EndTime      *time.Time
 	Limit        int
 	Offset       int
+}
+
+type VirtualTradeFilter struct {
+	Symbol    string
+	Side      string
+	StartTime *time.Time
+	EndTime   *time.Time
+	Limit     int
+	Offset    int
 }

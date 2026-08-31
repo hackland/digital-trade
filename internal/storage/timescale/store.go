@@ -68,6 +68,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 		"migrations/004_create_snapshots.up.sql",
 		"migrations/005_create_signals.up.sql",
 		"migrations/006_klines_unique_index.up.sql",
+		"migrations/007_create_virtual_trades.up.sql",
 	}
 
 	for _, path := range migrations {
