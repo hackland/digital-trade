@@ -283,9 +283,15 @@ func (e *Exchange) fillOrder(order *exchange.Order, fillPrice float64) error {
 	fee := cost * e.feeRate
 
 	if order.Side == exchange.OrderSideBuy {
-		// Check USDT balance
+		// Check USDT balance. The caller derives qty from balance/price (e.g. at
+		// alloc=100%, qty = balance/(price*(1+fee))), so cost+fee should equal
+		// the balance almost exactly — but the two computations round slightly
+		// differently in float64, and at 100% alloc there's no cash buffer left
+		// to absorb that, so a strict `<` here rejects orders that are actually
+		// fully covered. Allow a tiny epsilon for float64 rounding.
+		const epsilon = 1e-6
 		usdtBal := e.balances["USDT"]
-		if usdtBal.Free < cost+fee {
+		if usdtBal.Free < cost+fee-epsilon {
 			return fmt.Errorf("insufficient USDT: need %.2f, have %.2f", cost+fee, usdtBal.Free)
 		}
 		usdtBal.Free -= cost + fee

@@ -557,7 +557,12 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 
 	sig.Indicators["composite_score"] = composite
 
-	hasPosition := snap.Position != nil && snap.Position.Quantity > 0
+	// s.entryPrice > 0 covers signal-only mode: no real exchange position ever
+	// exists there, but OnTradeExecuted is still called with a virtual fill
+	// (see trader.go), so this keeps hold/cooldown/min-hold gating behaving
+	// exactly like a real (or backtest) position instead of re-firing a BUY
+	// alert every bar the score stays above threshold.
+	hasPosition := (snap.Position != nil && snap.Position.Quantity > 0) || s.entryPrice > 0
 	closePrice := 0.0
 	klineHigh := 0.0
 	if len(snap.Klines) > 0 {

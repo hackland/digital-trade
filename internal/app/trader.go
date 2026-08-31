@@ -702,14 +702,39 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 						shortHandler.OnShortSignalProcessed(sig.Action, price)
 					}
 					t.store.SaveSignal(ctx, sig, false)
-				} else if t.cfg.App.Mode == "live" && (sig.Action == strategy.Sell || !t.effectiveSignalOnly()) {
-					// Sell always executes when live, regardless of signal_only/trading_window —
-					// those gate new entries, not exits. A position must always be closeable.
+				} else if t.cfg.App.Mode == "live" && ((sig.Action == strategy.Sell && pos.Quantity > 0) || !t.effectiveSignalOnly()) {
+					// Sell always executes when live and there's a real position to close,
+					// regardless of signal_only/trading_window — those gate new entries, not
+					// exits. If pos.Quantity is 0 the "position" is only the virtual one
+					// tracked for signal-only alerts (see the branch below), so there is
+					// nothing real to sell — fall through to the virtual-fill path instead.
 					if err := t.order.ProcessSignal(ctx, sig); err != nil {
 						t.logger.Error("process signal", zap.Error(err))
 					}
 				} else {
-					// Paper mode, or a buy blocked by signal_only: just log and persist signal
+					// Paper mode, or a buy blocked by signal_only: no real order, but still
+					// feed the strategy a virtual fill so entryPrice/highWaterMark/cooldown
+					// track exactly like a real (or backtest) position. Without this, the
+					// strategy never leaves its "flat" state under signal_only, so it just
+					// re-fires a BUY alert on every bar the score clears the threshold
+					// instead of respecting cooldown/min_hold like the backtest does.
+					if sig.Action == strategy.Buy || sig.Action == strategy.Sell {
+						price := float64(0)
+						if len(snapshot.Klines) > 0 {
+							price = snapshot.Klines[len(snapshot.Klines)-1].Close
+						}
+						side := exchange.OrderSideBuy
+						if sig.Action == strategy.Sell {
+							side = exchange.OrderSideSell
+						}
+						t.strat.OnTradeExecuted(&exchange.Trade{
+							Symbol:    sig.Symbol,
+							Side:      side,
+							Price:     price,
+							Quantity:  1, // virtual fill: only entryPrice/cooldown state matters, not size
+							Timestamp: time.Now(),
+						})
+					}
 					t.store.SaveSignal(ctx, sig, false)
 				}
 			}

@@ -293,62 +293,21 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 		})
 	}
 
-	// Close any remaining position at the last price
-	if positionQty > 0 {
-		lastPrice := klines[len(klines)-1].Close
-		order, err := e.exchange.PlaceOrder(ctx, exchange.OrderRequest{
-			Symbol:   symbol,
-			Side:     exchange.OrderSideSell,
-			Type:     exchange.OrderTypeMarket,
-			Quantity: positionQty,
-		})
-		if err == nil && order.Status == exchange.OrderStatusFilled {
-			pnl := (lastPrice - avgEntryPrice) * positionQty
-
-			e.strat.OnTradeExecuted(&exchange.Trade{
-				Symbol:   symbol,
-				Side:     exchange.OrderSideSell,
-				Price:    order.AvgPrice,
-				Quantity: order.FilledQty,
-			})
-
-			tradeRecords = append(tradeRecords, TradeRecord{
-				Timestamp: klines[len(klines)-1].OpenTime,
-				Side:      "SELL",
-				Price:     order.AvgPrice,
-				Quantity:  order.FilledQty,
-				Fee:       order.AvgPrice * order.FilledQty * e.cfg.FeeRate,
-				PnL:       pnl,
-				Reason:    "backtest end: close position",
-			})
-			positionQty = 0
-		}
-	}
-
-	// Close any remaining short position at the last price
+	// Any position still open when the data runs out was never actually closed
+	// by the strategy — the backtest window just ended mid-hold. Don't place a
+	// synthetic market order or record a fake SELL/COVER for it: that would
+	// misrepresent the trade history (a "forced liquidation" isn't a real win
+	// or loss the strategy decided on) and skew win-rate stats with a trade
+	// that didn't happen. Still mark it to market for final equity so the
+	// reported return isn't understated.
+	lastPrice := klines[len(klines)-1].Close
+	unrealizedShortPnL := 0.0
 	if shortPositionQty > 0 {
-		lastPrice := klines[len(klines)-1].Close
-		pnl := (shortEntryPrice - lastPrice) * shortPositionQty
-		fee := lastPrice * shortPositionQty * e.cfg.FeeRate
-
-		if shortHandler, ok := e.strat.(ShortSignalHandler); ok {
-			shortHandler.OnShortSignalProcessed(strategy.Cover, lastPrice)
-		}
-
-		shortTradeRecords = append(shortTradeRecords, TradeRecord{
-			Timestamp: klines[len(klines)-1].OpenTime,
-			Side:      "COVER",
-			Price:     lastPrice,
-			Quantity:  shortPositionQty,
-			Fee:       fee,
-			PnL:       pnl,
-			Reason:    "backtest end: close short position",
-		})
-		shortPositionQty = 0
+		unrealizedShortPnL = (shortEntryPrice - lastPrice) * shortPositionQty
 	}
 
 	// Compute final equity
-	finalEquity := e.computeEquity(ctx, symbol, klines[len(klines)-1].Close, 0)
+	finalEquity := e.computeEquity(ctx, symbol, lastPrice, positionQty) + unrealizedShortPnL
 	if len(equityCurve) > 0 {
 		equityCurve[len(equityCurve)-1].Equity = finalEquity
 	}

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/jayce/btc-trader/internal/exchange"
+	"github.com/jayce/btc-trader/internal/market"
 	"github.com/jayce/btc-trader/internal/strategy"
 )
 
@@ -13,7 +14,7 @@ func makeSnapshot(close, volume float64, indicators strategy.IndicatorSet) *stra
 		Symbol: "BTCUSDT",
 		Klines: []exchange.Kline{
 			{Close: close * 0.99, High: close * 1.00, Low: close * 0.98, Volume: volume}, // prev bar
-			{Close: close, High: close * 1.01, Low: close * 0.99, Volume: volume},         // current bar
+			{Close: close, High: close * 1.01, Low: close * 0.99, Volume: volume},        // current bar
 		},
 		Indicators: indicators,
 	}
@@ -150,17 +151,44 @@ func TestMACDModuleScore(t *testing.T) {
 func TestKDJModuleScore(t *testing.T) {
 	mod, _ := Create("kdj", nil)
 
-	// Initialize with K below D
-	snap := makeSnapshot(50000, 100, strategy.IndicatorSet{
-		KDJ: strategy.KDJValue{K: 20, D: 25, J: 10},
+	// KDJModule.Score is stateless: it recomputes K/D one bar earlier from
+	// snap.Klines itself, so the test needs a real kline sequence rather than
+	// injecting IndicatorSet.KDJ values and relying on remembered state across
+	// two calls (see the comment on MFIModule.Score for why the module was
+	// changed away from that design).
+	//
+	// Build a declining run (keeps K/D low and roughly flat) followed by a
+	// sharp final-bar rally to a new high, which pushes the latest bar's K
+	// above D with strong upward K momentum — a genuine golden cross.
+	klines := make([]exchange.Kline, 0, 26)
+	price := 100.0
+	for i := 0; i < 25; i++ {
+		price -= 0.5
+		klines = append(klines, exchange.Kline{
+			Close: price, High: price + 0.3, Low: price - 0.3, Volume: 100,
+		})
+	}
+	lastClose := price + 15 // sharp rally to a new high
+	klines = append(klines, exchange.Kline{
+		Close: lastClose, High: lastClose + 0.5, Low: price - 0.3, Volume: 100,
 	})
-	mod.Score(snap)
 
-	// Golden cross: K crosses above D, with strong K momentum up
-	snap.Indicators.KDJ = strategy.KDJValue{K: 35, D: 30, J: 45}
+	ic := market.NewIndicatorComputer()
+	highs, lows, closes := make([]float64, len(klines)), make([]float64, len(klines)), make([]float64, len(klines))
+	for i, k := range klines {
+		highs[i], lows[i], closes[i] = k.High, k.Low, k.Close
+	}
+	kdj := ic.ComputeKDJ(highs, lows, closes, 9, 3, 3)
+
+	snap := &strategy.MarketSnapshot{
+		Symbol:     "BTCUSDT",
+		Klines:     klines,
+		Indicators: strategy.IndicatorSet{KDJ: kdj},
+	}
+
 	score := mod.Score(snap)
 	if score <= 0 {
-		t.Errorf("KDJ golden cross with momentum should give positive score, got %.2f", score)
+		t.Errorf("KDJ golden cross with momentum should give positive score, got %.2f (kdj=%+v)", score, kdj)
 	}
 }
 

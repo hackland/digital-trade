@@ -58,6 +58,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "load klines: %v\n", err)
 		os.Exit(1)
 	}
+	// Drop the still-forming trailing bar (its close keeps moving) so the last
+	// evaluated bar matches the one live's most recent CLOSED-candle decision
+	// was based on, not whatever partial bar happened to be in the DB at fetch time.
+	for len(klinesMain) > 0 && klinesMain[len(klinesMain)-1].OpenTime.Hour() != 20 {
+		klinesMain = klinesMain[:len(klinesMain)-1]
+	}
 	klinesHTF, err := store.GetKlines(ctx, symbol, "1d", start.Add(-30*24*time.Hour), end, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load htf: %v\n", err)
@@ -91,7 +97,7 @@ func main() {
 	}
 
 	engineCfg := backtest.EngineConfig{
-		Symbol: symbol, Interval: mainInterval, InitialCash: 10000, FeeRate: 0.001, AllocPct: 0.1,
+		Symbol: symbol, Interval: mainInterval, InitialCash: 10000, FeeRate: 0.001, AllocPct: 1.0,
 		HTFKlines: klinesHTF, HTFInterval: "1d",
 		HTFIndReqs:  strat.HTFIndicatorRequirements(),
 		HTFHistSize: strat.HTFHistoryRequired(),
@@ -101,6 +107,15 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "run: %v\n", err)
 		os.Exit(1)
+	}
+
+	if diag := strat.GetDiagnostics(symbol); diag != nil {
+		fmt.Printf("=== last evaluated bar diagnostics ===\n")
+		fmt.Printf("timestamp=%s action=%s composite=%.4f buy_threshold=%.4f\n", diag.Timestamp, diag.Action, diag.CompositeScore, diag.BuyThreshold)
+		fmt.Printf("has_position=%v cooldown_count=%d confirm_count=%d\n", diag.HasPosition, diag.CooldownCount, diag.ConfirmCount)
+		fmt.Printf("htf_enabled=%v htf_bullish=%v htf_ema_dist_pct=%.4f\n", diag.HTFEnabled, diag.HTFBullish, diag.HTFEMADist)
+		fmt.Printf("module_scores=%v\n", diag.ModuleScores)
+		fmt.Printf("hold_reason=%s\n\n", diag.HoldReason)
 	}
 
 	fmt.Printf("=== hard_stop_pct=%.2f ===\n", hardStopPct)
