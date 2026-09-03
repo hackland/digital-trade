@@ -1,20 +1,20 @@
 package modules
 
-import "github.com/jayce/btc-trader/internal/strategy"
+import (
+	"github.com/jayce/btc-trader/internal/market"
+	"github.com/jayce/btc-trader/internal/strategy"
+)
 
 // KDJModule scores based on KDJ stochastic golden/death cross and J-value extremes.
 type KDJModule struct {
-	period      int
-	kSmooth     int
-	dSmooth     int
-	prevK       float64
-	prevD       float64
-	initialized bool
+	period  int
+	kSmooth int
+	dSmooth int
 }
 
-func (m *KDJModule) Name() string        { return "kdj" }
-func (m *KDJModule) Category() string     { return "momentum" }
-func (m *KDJModule) Label() string        { return "KDJ 随机指标" }
+func (m *KDJModule) Name() string           { return "kdj" }
+func (m *KDJModule) Category() string       { return "momentum" }
+func (m *KDJModule) Label() string          { return "KDJ 随机指标" }
 func (m *KDJModule) DefaultWeight() float64 { return 0.15 }
 
 func (m *KDJModule) Description() string {
@@ -54,16 +54,29 @@ func (m *KDJModule) RequiredHistory() int {
 	return m.period + 10
 }
 
+var kdjComputer = market.NewIndicatorComputer()
+
+// Score is a pure function of the snapshot: K/D one bar earlier is recomputed
+// from snap.Klines rather than remembered across calls, so a live process and
+// a fresh backtest replay always agree on the same bar (see the comment on
+// MFIModule.Score for why remembered state silently drifts otherwise).
 func (m *KDJModule) Score(snap *strategy.MarketSnapshot) float64 {
 	kdj := snap.Indicators.KDJ
 	k, d, j := kdj.K, kdj.D, kdj.J
 
-	if !m.initialized {
-		m.prevK = k
-		m.prevD = d
-		m.initialized = true
+	minBars := m.period + m.kSmooth + m.dSmooth
+	if len(snap.Klines) < minBars+1 {
 		return 0
 	}
+	prevWindow := snap.Klines[:len(snap.Klines)-1]
+	highs := make([]float64, len(prevWindow))
+	lows := make([]float64, len(prevWindow))
+	closes := make([]float64, len(prevWindow))
+	for i, kl := range prevWindow {
+		highs[i], lows[i], closes[i] = kl.High, kl.Low, kl.Close
+	}
+	prevKDJ := kdjComputer.ComputeKDJ(highs, lows, closes, m.period, m.kSmooth, m.dSmooth)
+	prevK, prevD := prevKDJ.K, prevKDJ.D
 
 	score := 0.0
 
@@ -75,18 +88,15 @@ func (m *KDJModule) Score(snap *strategy.MarketSnapshot) float64 {
 	}
 
 	// K/D crossover
-	if m.prevK <= m.prevD && k > d {
+	if prevK <= prevD && k > d {
 		score += 0.3 // golden cross
-	} else if m.prevK >= m.prevD && k < d {
+	} else if prevK >= prevD && k < d {
 		score -= 0.3 // death cross
 	}
 
 	// K value momentum -- primary signal driver
-	kChange := k - m.prevK
+	kChange := k - prevK
 	score += tanhScore(kChange, 0, 8) * 0.5
-
-	m.prevK = k
-	m.prevD = d
 
 	return clamp(score, -1.0, 1.0)
 }
