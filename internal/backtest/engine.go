@@ -60,6 +60,18 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 		return nil, fmt.Errorf("no kline data to backtest")
 	}
 
+	// Drop trailing still-forming (non-final) klines — live trading only ever
+	// evaluates the strategy on closed bars (see trader.go), so a backtest that
+	// includes an incomplete last candle would fire signals on a price that
+	// hasn't actually settled yet, and then immediately force-close at that
+	// same bar, producing a phantom zero-PnL trade at the end of every run.
+	for len(klines) > 0 && !klines[len(klines)-1].IsFinal {
+		klines = klines[:len(klines)-1]
+	}
+	if len(klines) == 0 {
+		return nil, fmt.Errorf("no closed kline data to backtest")
+	}
+
 	histSize := e.strat.RequiredHistory()
 	if len(klines) < histSize {
 		return nil, fmt.Errorf("not enough kline data: have %d, need %d", len(klines), histSize)

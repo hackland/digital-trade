@@ -11,11 +11,12 @@ import (
 // --- Kline conversion ---
 
 func convertKline(symbol, interval string, bk *gobinance.Kline) exchange.Kline {
+	closeTime := msToTime(bk.CloseTime)
 	return exchange.Kline{
 		Symbol:      symbol,
 		Interval:    interval,
 		OpenTime:    msToTime(bk.OpenTime),
-		CloseTime:   msToTime(bk.CloseTime),
+		CloseTime:   closeTime,
 		Open:        parseFloat(bk.Open),
 		High:        parseFloat(bk.High),
 		Low:         parseFloat(bk.Low),
@@ -23,7 +24,10 @@ func convertKline(symbol, interval string, bk *gobinance.Kline) exchange.Kline {
 		Volume:      parseFloat(bk.Volume),
 		QuoteVolume: parseFloat(bk.QuoteAssetVolume),
 		Trades:      int64(bk.TradeNum),
-		IsFinal:     true,
+		// REST /klines can return the still-forming current candle as the last
+		// element when the query range reaches "now" — only mark it final once
+		// its close time has actually passed, matching the WS stream's semantics.
+		IsFinal: !closeTime.After(time.Now()),
 	}
 }
 
