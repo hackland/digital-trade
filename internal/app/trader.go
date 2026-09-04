@@ -252,6 +252,39 @@ func (t *Trader) Run(ctx context.Context) error {
 	// the virtual_trades table so alert-only P&L tracking survives restart.
 	t.vledger.Recover(ctx, t.cfg.Exchange.Symbols)
 
+	// Sync any recovered open virtual LONG position into the strategy's own
+	// state, so it starts back up already treating the symbol as "in
+	// position" (hasPosition, cooldown, ATR/hard-stop) instead of firing a
+	// fresh Buy alert on the very first bar after restart — mirrors the
+	// real-position recovery block above, but for signal_only virtual fills.
+	if t.strat != nil {
+		for _, symbol := range t.cfg.Exchange.Symbols {
+			longState, ok := t.vledger.Snapshot(symbol)["LONG"]
+			if !ok || !longState.InPosition {
+				continue
+			}
+			if realPos := t.position.GetPosition(symbol); realPos != nil && realPos.Quantity > 0 {
+				// Real position also open on this symbol — the real-position
+				// recovery block above already synced the strategy's state.
+				continue
+			}
+			ts := time.Now()
+			if openTrade, err := t.store.GetLatestVirtualTrade(ctx, symbol, "BUY"); err == nil && openTrade != nil {
+				ts = openTrade.Timestamp
+			}
+			t.strat.OnTradeExecuted(&exchange.Trade{
+				Symbol:    symbol,
+				Side:      exchange.OrderSideBuy,
+				Price:     longState.EntryPrice,
+				Timestamp: ts,
+			})
+			t.logger.Info("virtual ledger: synced open position into strategy state",
+				zap.String("symbol", symbol),
+				zap.Float64("entry_price", longState.EntryPrice),
+			)
+		}
+	}
+
 	// Load exchange symbol info (stepSize, minQty, etc.) for order precision
 	if err := t.order.LoadSymbolInfo(ctx); err != nil {
 		t.logger.Warn("failed to load symbol info, orders may fail precision checks", zap.Error(err))
@@ -711,17 +744,55 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 					// Track hypothetical P&L for this alert-only short leg (survives restart).
 					vres = t.vledger.OnAlertOnlySignal(ctx, sig, price)
 					t.store.SaveSignal(ctx, sig, false)
-				} else if t.cfg.App.Mode == "live" && (sig.Action == strategy.Sell || !t.effectiveSignalOnly()) {
-					// Sell always executes when live, regardless of signal_only/trading_window —
-					// those gate new entries, not exits. A position must always be closeable.
+				} else if t.cfg.App.Mode == "live" && sig.Action == strategy.Sell {
+					// A Sell can close either a real position (opened by a real Buy) or a
+					// virtual one (opened by a Buy that was blocked by signal_only — see
+					// below). Route by whichever actually exists: sending a virtual close
+					// through the real order path would try to sell a position the
+					// exchange never opened.
+					realPos := t.position.GetPosition(sig.Symbol)
+					if realPos != nil && realPos.Quantity > 0 {
+						// Sell always executes when live, regardless of signal_only/trading_window —
+						// those gate new entries, not exits. A position must always be closeable.
+						if err := t.order.ProcessSignal(ctx, sig); err != nil {
+							t.logger.Error("process signal", zap.Error(err))
+						}
+					} else {
+						vres = t.vledger.OnAlertOnlySignal(ctx, sig, price)
+						if vres != nil && vres.Closed {
+							// Reset the strategy's entry/cooldown state so it stops treating
+							// this symbol as "in position" now that the virtual leg is closed.
+							t.strat.OnTradeExecuted(&exchange.Trade{
+								Symbol:    sig.Symbol,
+								Side:      exchange.OrderSideSell,
+								Price:     price,
+								Timestamp: time.Now(),
+							})
+						}
+						t.store.SaveSignal(ctx, sig, false)
+					}
+				} else if t.cfg.App.Mode == "live" && sig.Action == strategy.Buy && !t.effectiveSignalOnly() {
 					if err := t.order.ProcessSignal(ctx, sig); err != nil {
 						t.logger.Error("process signal", zap.Error(err))
 					}
 				} else if t.cfg.App.Mode == "live" && sig.Action == strategy.Buy && t.effectiveSignalOnly() {
 					// Buy blocked by signal_only: no real order placed. Track hypothetical
 					// long P&L so the alert-only signal stream still accumulates a virtual
-					// equity curve (survives restart via virtual_trades).
+					// equity curve (survives restart via virtual_trades), and drive the
+					// strategy's own entry/highWaterMark/cooldown state machine from this
+					// virtual fill so it correctly treats the symbol as "in position" —
+					// otherwise hasPosition stays false forever (no real order was ever
+					// placed) and the Buy alert re-fires every bar the score clears
+					// threshold instead of just once per virtual position.
 					vres = t.vledger.OnAlertOnlySignal(ctx, sig, price)
+					if vres != nil && vres.Opened {
+						t.strat.OnTradeExecuted(&exchange.Trade{
+							Symbol:    sig.Symbol,
+							Side:      exchange.OrderSideBuy,
+							Price:     vres.EntryPrice,
+							Timestamp: time.Now(),
+						})
+					}
 					t.store.SaveSignal(ctx, sig, false)
 				} else {
 					// Paper mode: no real/virtual order simulation exists for this path today.

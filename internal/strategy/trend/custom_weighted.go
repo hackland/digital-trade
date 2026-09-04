@@ -625,7 +625,7 @@ func (s *CustomWeightedStrategy) Evaluate(ctx context.Context, snap *strategy.Ma
 	// (see trader.go), so this keeps hold/cooldown/min-hold gating behaving
 	// exactly like a real (or backtest) position instead of re-firing a BUY
 	// alert every bar the score stays above threshold.
-	hasPosition := (snap.Position != nil && snap.Position.Quantity > 0) || s.entryPrice > 0
+	hasPosition := (snap.Position != nil && snap.Position.Quantity > 0) || st.entryPrice > 0
 	closePrice := 0.0
 	klineHigh := 0.0
 	if len(snap.Klines) > 0 {
