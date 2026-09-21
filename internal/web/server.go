@@ -74,6 +74,8 @@ func NewServer(deps *handler.Deps, logger *zap.Logger) *Server {
 		api.POST("/backtest", h.RunBacktest)
 		api.POST("/strategy/deploy", h.DeployStrategy)
 		api.GET("/backtest/strategies", h.GetStrategies)
+		api.POST("/grid-backtest", h.RunGridBacktest)
+		api.GET("/grid-backtest/suggest-range", h.SuggestGridRange)
 
 		// 条件触发干预
 		api.GET("/overrides", h.ListOverrides)

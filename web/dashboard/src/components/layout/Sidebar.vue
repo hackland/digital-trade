@@ -35,6 +35,10 @@
       <el-icon><Bottom /></el-icon>
       <span>Short Strategy</span>
     </el-menu-item>
+    <el-menu-item index="/grid-strategy">
+      <el-icon><Grid /></el-icon>
+      <span>Grid Strategy</span>
+    </el-menu-item>
     <el-menu-item index="/risk">
       <el-icon><Warning /></el-icon>
       <span>Risk</span>
@@ -48,7 +52,7 @@
 
 <script setup lang="ts">
 import { useRoute } from 'vue-router'
-import { Odometer, TrendCharts, List, Tickets, Aim, DataAnalysis, Warning, Setting, Bottom, Compass } from '@element-plus/icons-vue'
+import { Odometer, TrendCharts, List, Tickets, Aim, DataAnalysis, Warning, Setting, Bottom, Compass, Grid } from '@element-plus/icons-vue'
 
 const route = useRoute()
 </script>
