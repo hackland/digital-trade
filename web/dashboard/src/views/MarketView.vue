@@ -8,7 +8,7 @@
             <el-option v-for="s in SYMBOLS" :key="s" :label="s" :value="s" />
           </el-select>
           <el-radio-group v-model="interval" size="small">
-            <el-radio-button v-for="i in INTERVALS" :key="i" :value="i">{{ i }}</el-radio-button>
+            <el-radio-button v-for="i in marketIntervals" :key="i" :value="i">{{ i }}</el-radio-button>
           </el-radio-group>
         </div>
 
@@ -66,6 +66,10 @@ interface RegimeResult {
   regime: string
   regime_label: string
 }
+
+// Weekly added on top of the shared INTERVALS list, local to this view only —
+// backtest/trades views reuse INTERVALS and aren't meant to run on 1w bars.
+const marketIntervals = [...INTERVALS, '1w']
 
 const symbol = ref('BTCUSDT')
 const interval = ref('5m')

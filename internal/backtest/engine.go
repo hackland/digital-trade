@@ -110,7 +110,17 @@ func (e *Engine) Run(ctx context.Context, klines []exchange.Kline) (*Result, err
 		}
 
 		currentBar := klines[i]
-		window := klines[i-histSize : i+1]
+		// Mirror the live engine's windowing (trader.go): let the window grow
+		// as history accumulates, capped at 2x the required size, instead of a
+		// fixed histSize+1 slice. A long-period EMA (e.g. 200) barely moves off
+		// its SMA seed with only histSize+10 bars behind it — feeding the same
+		// amount of warm-up as live keeps indicator values consistent between
+		// backtest and production.
+		windowStart := i - histSize*2
+		if windowStart < 0 {
+			windowStart = 0
+		}
+		window := klines[windowStart : i+1]
 
 		// Set market price in simulated exchange
 		e.exchange.SetPrice(symbol, currentBar.Close)

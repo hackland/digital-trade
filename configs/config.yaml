@@ -4,7 +4,7 @@ app:
   log_level: info      # debug | info | warn | error
   testnet: false
   signal_only: true    # true=不实际下单，只推送买卖点信号（已暂停自动下单）
-  instance_label: "VPS机器"
+  instance_label: "cabbal工作机器"
   trading_window:
     enabled: false     # 暂停夜间自动下单，全天只提醒不下单；要恢复把这里改回 true
     start: "00:00"
@@ -20,6 +20,9 @@ exchange:
     - 1m
     - 5m
     - 1h
+    - 4h
+    - 1d
+    - 1w
 
 database:
   dsn: postgres://trader:trader123@localhost:5432/btc_trader?sslmode=disable
