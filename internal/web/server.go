@@ -66,6 +66,11 @@ func NewServer(deps *handler.Deps, logger *zap.Logger) *Server {
 		api.GET("/ticker/:symbol", h.GetTicker)
 		api.GET("/market/regime", h.GetMarketRegime)
 		api.GET("/market/opportunity", h.GetOpportunityAnalysis)
+		api.GET("/mtf-macd/status", h.GetMTFMACDStatus)
+		api.GET("/mtf-macd/signals", h.GetMTFMACDSignals)
+		api.POST("/mtf-macd/config", h.SetMTFMACDConfig)
+		api.POST("/mtf-macd/backtest", h.RunMTFMACDBacktest)
+		api.GET("/mtf-macd/window", h.GetMTFMACDWindow)
 
 		// 市场情绪
 		api.GET("/sentiment/funding", h.GetFundingRate)

@@ -4,6 +4,7 @@ import (
 	"github.com/jayce/btc-trader/internal/config"
 	"github.com/jayce/btc-trader/internal/eventbus"
 	"github.com/jayce/btc-trader/internal/exchange"
+	"github.com/jayce/btc-trader/internal/mtfmacd"
 	"github.com/jayce/btc-trader/internal/order"
 	"github.com/jayce/btc-trader/internal/override"
 	"github.com/jayce/btc-trader/internal/position"
@@ -25,6 +26,7 @@ type Deps struct {
 	Override      *override.Manager
 	Strategy      strategy.Strategy
 	VirtualLedger VirtualLedgerReader
+	MTFMACD       *mtfmacd.Watcher // nil when mtf_macd is disabled
 }
 
 // VirtualLedgerReader is the minimal read interface the dashboard needs from

@@ -205,6 +205,51 @@ func (ic *IndicatorComputer) ComputeMACD(closes []float64, fast, slow, signal in
 	}
 }
 
+// MACDSeries holds the full MACD history aligned with the input closes.
+// Entries before First are not valid (warm-up) and are left at zero.
+type MACDSeries struct {
+	MACD      []float64
+	Signal    []float64
+	Histogram []float64
+	First     int // first index with a valid MACD/Signal/Histogram
+}
+
+// ComputeMACDSeries returns MACD / Signal / Histogram for every bar.
+// It uses the same SMA-seeded EMA as ComputeMACD, so the last element matches it.
+func (ic *IndicatorComputer) ComputeMACDSeries(closes []float64, fast, slow, signal int) MACDSeries {
+	n := len(closes)
+	out := MACDSeries{First: slow + signal - 2}
+	if n < slow+signal {
+		return out
+	}
+	fastS := ic.computeEMASeries(closes, fast)
+	slowS := ic.computeEMASeries(closes, slow)
+	if fastS == nil || slowS == nil {
+		return out
+	}
+	out.MACD = make([]float64, n)
+	out.Signal = make([]float64, n)
+	out.Histogram = make([]float64, n)
+	for i := slow - 1; i < n; i++ {
+		out.MACD[i] = fastS[i] - slowS[i]
+	}
+	// Signal line: EMA(signal) of the MACD line, seeded with SMA.
+	seedEnd := slow - 1 + signal
+	sum := 0.0
+	for i := slow - 1; i < seedEnd; i++ {
+		sum += out.MACD[i]
+	}
+	out.Signal[seedEnd-1] = sum / float64(signal)
+	mult := 2.0 / float64(signal+1)
+	for i := seedEnd; i < n; i++ {
+		out.Signal[i] = (out.MACD[i]-out.Signal[i-1])*mult + out.Signal[i-1]
+	}
+	for i := out.First; i < n; i++ {
+		out.Histogram[i] = out.MACD[i] - out.Signal[i]
+	}
+	return out
+}
+
 // ComputeRSI calculates Relative Strength Index.
 func (ic *IndicatorComputer) ComputeRSI(closes []float64, period int) float64 {
 	if len(closes) < period+1 {

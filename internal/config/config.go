@@ -17,6 +17,15 @@ type Config struct {
 	Dashboard DashboardConfig `mapstructure:"dashboard"`
 	Snapshot  SnapshotConfig  `mapstructure:"snapshot"`
 	Telegram  TelegramConfig  `mapstructure:"telegram"`
+	MTFMACD   MTFMACDConfig   `mapstructure:"mtf_macd"`
+}
+
+// MTFMACDConfig 三周期(4h/1h/15m) MACD 共振信号监控，仅提示不下单。
+type MTFMACDConfig struct {
+	Enabled              bool   `mapstructure:"enabled"`
+	Symbol               string `mapstructure:"symbol"`
+	Require15mBeyondZero bool   `mapstructure:"require_15m_beyond_zero"` // 做多要求15m金叉时DIF在0轴下方，做空要求在0轴上方
+	Telegram             bool   `mapstructure:"telegram"`
 }
 
 type TelegramConfig struct {
@@ -139,6 +148,10 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("database.conn_max_lifetime", "5m")
 	v.SetDefault("dashboard.addr", ":9090")
 	v.SetDefault("snapshot.interval", "5m")
+	v.SetDefault("mtf_macd.enabled", true)
+	v.SetDefault("mtf_macd.symbol", "BTCUSDT")
+	v.SetDefault("mtf_macd.require_15m_beyond_zero", false)
+	v.SetDefault("mtf_macd.telegram", true)
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {

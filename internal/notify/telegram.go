@@ -168,6 +168,14 @@ func (n *TelegramNotifier) handleRisk(ctx context.Context, evt eventbus.Event) {
 	n.send(ctx, msg)
 }
 
+// Send posts a free-form message (prefix applied). No-op when notifications are disabled.
+func (n *TelegramNotifier) Send(ctx context.Context, text string) {
+	if !n.cfg.Enabled || n.cfg.Token == "" || n.cfg.ChatID == "" {
+		return
+	}
+	n.send(ctx, text)
+}
+
 // send sends a Markdown message to Telegram. Tries Markdown first; on 400
 // (typically caused by unescaped special chars in interpolated error strings)
 // retries with parse_mode disabled so the message still gets through.

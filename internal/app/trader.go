@@ -12,6 +12,7 @@ import (
 	"github.com/jayce/btc-trader/internal/exchange"
 	"github.com/jayce/btc-trader/internal/exchange/binance"
 	"github.com/jayce/btc-trader/internal/market"
+	"github.com/jayce/btc-trader/internal/mtfmacd"
 	"github.com/jayce/btc-trader/internal/notify"
 	"github.com/jayce/btc-trader/internal/order"
 	"github.com/jayce/btc-trader/internal/override"
@@ -308,6 +309,18 @@ func (t *Trader) Run(ctx context.Context) error {
 		return t.runSnapshotLoop(gCtx)
 	})
 
+	// 三周期(4h/1h/15m) MACD 共振监控：仅提示，不下单
+	var mtfWatcher *mtfmacd.Watcher
+	if t.cfg.MTFMACD.Enabled {
+		p := mtfmacd.DefaultParams()
+		p.Require15mBeyondZero = t.cfg.MTFMACD.Require15mBeyondZero
+		mtfWatcher = mtfmacd.NewWatcher(t.exchange, t.cfg.MTFMACD.Symbol, p, t.cfg.MTFMACD.Telegram, t.logger.Named("mtfmacd"))
+		g.Go(func() error {
+			mtfWatcher.Run(gCtx)
+			return nil
+		})
+	}
+
 	// Dashboard server
 	if t.cfg.Dashboard.Enabled {
 		deps := &handler.Deps{
@@ -321,6 +334,7 @@ func (t *Trader) Run(ctx context.Context) error {
 			Override:      t.override,
 			Strategy:      t.strat,
 			VirtualLedger: t.vledger,
+			MTFMACD:       mtfWatcher,
 		}
 		dashServer := web.NewServer(deps, t.logger.Named("dashboard"))
 
@@ -363,6 +377,9 @@ func (t *Trader) Run(ctx context.Context) error {
 		}
 		tgCfg.Prefix = fmt.Sprintf("%s *[%s]* ", envEmoji, envLabel)
 		tgNotifier := notify.NewTelegramNotifier(tgCfg, t.bus, t.logger.Named("telegram"))
+		if mtfWatcher != nil {
+			mtfWatcher.SetNotifier(tgNotifier.Send)
+		}
 		g.Go(func() error {
 			return tgNotifier.Run(gCtx)
 		})
@@ -717,10 +734,34 @@ func (t *Trader) runStrategyLoop(ctx context.Context) error {
 					if err := t.order.ProcessSignal(ctx, sig); err != nil {
 						t.logger.Error("process signal", zap.Error(err))
 					}
+					// If this Sell closed a virtual position (no real exchange position
+					// existed — order.ProcessSignal just flattened local state via
+					// errDustPosition), also close it out in the virtual ledger so its
+					// inPosition flag clears and future alert-only Buys get PnL-tracked again.
+					// Gated on real position absence, not the current signal_only value:
+					// trading_window can flip signal_only between when a virtual position
+					// was opened and when it closes, and closeLocked() is a no-op anyway
+					// when the ledger has nothing open for this symbol, so this never
+					// double-counts a real trade's own accounting.
+					if sig.Action == strategy.Sell && (snapshot.Position == nil || snapshot.Position.Quantity <= 0) {
+						vres = t.vledger.OnAlertOnlySignal(ctx, sig, price)
+						t.store.SaveSignal(ctx, sig, false)
+					}
 				} else if t.cfg.App.Mode == "live" && sig.Action == strategy.Buy && t.effectiveSignalOnly() {
 					// Buy blocked by signal_only: no real order placed. Track hypothetical
 					// long P&L so the alert-only signal stream still accumulates a virtual
 					// equity curve (survives restart via virtual_trades).
+					// Also sync strategy state (entryPrice) so hasPosition flips true on the
+					// next Evaluate — otherwise the strategy never reaches its SELL branch and
+					// just re-fires BUY forever with no matching close alert.
+					if t.strat != nil {
+						t.strat.OnTradeExecuted(&exchange.Trade{
+							Symbol:    sig.Symbol,
+							Side:      exchange.OrderSideBuy,
+							Price:     price,
+							Timestamp: time.Now(),
+						})
+					}
 					vres = t.vledger.OnAlertOnlySignal(ctx, sig, price)
 					t.store.SaveSignal(ctx, sig, false)
 				} else {

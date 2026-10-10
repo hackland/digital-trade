@@ -19,7 +19,10 @@ exchange:
   kline_intervals:
     - 1m
     - 5m
+    - 15m
     - 1h
+    - 4h
+    - 1d
 
 database:
   dsn: postgres://trader:trader123@localhost:5432/btc_trader?sslmode=disable
