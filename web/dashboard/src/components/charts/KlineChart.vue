@@ -59,7 +59,7 @@ async function loadChart() {
     priceScaleId: 'right',
   })
   candleSeries.priceScale().applyOptions({
-    scaleMargins: { top: 0.05, bottom: 0.3 },
+    scaleMargins: { top: 0.05, bottom: 0.08 },
   })
 
   // Volume histogram — bottom 25%
@@ -84,7 +84,7 @@ async function loadChart() {
         const c = k.close ?? (k as any).Close
         const h = k.high ?? (k as any).High
         const l = k.low ?? (k as any).Low
-        const v = k.volume ?? (k as any).Volume
+        const v = k.quote_volume ?? (k as any).QuoteVolume ?? k.volume ?? (k as any).Volume
 
         candleData.push({ time: t as any, open: o, high: h, low: l, close: c })
         volData.push({ time: t as any, value: v, color: volumeColor(o, c) })
@@ -109,7 +109,7 @@ async function loadChart() {
     const h = kline.high ?? kline.High
     const l = kline.low ?? kline.Low
     const c = kline.close ?? kline.Close
-    const v = kline.volume ?? kline.Volume
+    const v = kline.quote_volume ?? kline.QuoteVolume ?? kline.volume ?? kline.Volume
 
     candleSeries?.update({ time: t as any, open: o, high: h, low: l, close: c })
     volumeSeries?.update({ time: t as any, value: v, color: volumeColor(o, c) })

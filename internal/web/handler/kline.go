@@ -24,6 +24,8 @@ func defaultLookback(interval string, limit int) time.Duration {
 		perCandle = 4 * time.Hour
 	case "1d":
 		perCandle = 24 * time.Hour
+	case "1w":
+		perCandle = 7 * 24 * time.Hour
 	default:
 		perCandle = 5 * time.Minute
 	}

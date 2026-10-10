@@ -80,10 +80,12 @@ func (h *Handler) GetOpportunityAnalysis(c *gin.Context) {
 	}
 	a.ScoreGap = a.BuyThreshold - a.CompositeScore
 
-	// Daily EMAs
+	// Daily EMAs — pull the full available history (same as GetMarketRegime)
+	// so EMA200's seed actually converges instead of barely moving off a
+	// 210-bar SMA; keeps this panel's numbers consistent with the Market page.
 	ic := market.NewIndicatorComputer()
-	dailyStart := time.Now().Add(-210 * 24 * time.Hour)
-	dailyKlines, _ := h.deps.Store.GetKlines(ctx, symbol, "1d", dailyStart, time.Now(), 210)
+	dailyStart := time.Now().Add(-20 * 365 * 24 * time.Hour)
+	dailyKlines, _ := h.deps.Store.GetKlines(ctx, symbol, "1d", dailyStart, time.Now(), 0)
 	if len(dailyKlines) >= 50 {
 		closes := make([]float64, len(dailyKlines))
 		for i, k := range dailyKlines {
