@@ -56,8 +56,7 @@
 
 <script setup lang="ts">
 import { useRoute } from 'vue-router'
-import { Odometer, TrendCharts, List, Tickets, Aim, DataAnalysis, Warning, Setting, Bottom, Compass, Connection } from '@element-plus/icons-vue'
-import { Odometer, TrendCharts, List, Tickets, Aim, DataAnalysis, Warning, Setting, Bottom, Compass, Grid } from '@element-plus/icons-vue'
+import { Odometer, TrendCharts, List, Tickets, Aim, DataAnalysis, Warning, Setting, Bottom, Compass, Connection, Grid } from '@element-plus/icons-vue'
 
 const route = useRoute()
 </script>
