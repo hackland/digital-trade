@@ -44,6 +44,7 @@ go run ./cmd/btcompare    # 策略对比
 | `internal/risk/manager.go` | 风控（日亏损/回撤/频率） |
 | `internal/storage/timescale/` | TimescaleDB 5个 Repository |
 | `internal/web/` | Dashboard REST + WS API |
+| `internal/ict/` | ICT 规则信号引擎（扫荡→MSS→FVG/OB，仅提示+回测，不接策略引擎），菜单「ICT 信号」 |
 | `web/dashboard/` | Vue3 前端 |
 | `cmd/` | 各独立工具入口 |
 

@@ -39,6 +39,10 @@
       <el-icon><Connection /></el-icon>
       <span>三周期共振</span>
     </el-menu-item>
+    <el-menu-item index="/ict">
+      <el-icon><DataLine /></el-icon>
+      <span>ICT 信号</span>
+    </el-menu-item>
     <el-menu-item index="/grid-strategy">
       <el-icon><Grid /></el-icon>
       <span>Grid Strategy</span>
@@ -56,7 +60,7 @@
 
 <script setup lang="ts">
 import { useRoute } from 'vue-router'
-import { Odometer, TrendCharts, List, Tickets, Aim, DataAnalysis, Warning, Setting, Bottom, Compass, Connection, Grid } from '@element-plus/icons-vue'
+import { Odometer, TrendCharts, List, Tickets, Aim, DataAnalysis, Warning, Setting, Bottom, Compass, Connection, Grid, DataLine } from '@element-plus/icons-vue'
 
 const route = useRoute()
 </script>

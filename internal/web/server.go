@@ -71,6 +71,8 @@ func NewServer(deps *handler.Deps, logger *zap.Logger) *Server {
 		api.POST("/mtf-macd/config", h.SetMTFMACDConfig)
 		api.POST("/mtf-macd/backtest", h.RunMTFMACDBacktest)
 		api.GET("/mtf-macd/window", h.GetMTFMACDWindow)
+		api.GET("/ict/scan", h.GetICTScan)
+		api.POST("/ict/backtest", h.RunICTBacktest)
 
 		// 市场情绪
 		api.GET("/sentiment/funding", h.GetFundingRate)
